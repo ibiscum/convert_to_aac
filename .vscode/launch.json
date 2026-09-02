@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:convert_to_aac}",
+            "name": "Debug convert_to_aac",
+            "target": "convert_to_aac",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug convert_to_aac"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:convert_to_aac}",
+            "name": "Release convert_to_aac",
+            "target": "convert_to_aac",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release convert_to_aac"
+        }
+    ]
+}
