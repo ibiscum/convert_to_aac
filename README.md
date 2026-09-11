@@ -60,7 +60,7 @@ If called with invalid options or insufficient arguments, the program prints a s
 - .aac and .m4a source files are copied to target path without conversion
 - After afconvert, metadata and embedded cover art are transferred from the source file using ffmpeg (audio is copied, not re-encoded)
 - If ffmpeg is not installed, conversion still proceeds but metadata/artwork will not be preserved
-- If target file already exists and validates as AAC, processing is skipped
+- If the expected target file already exists in the target folder and is a valid AAC file, processing is skipped
 - Hidden files and directories are skipped during traversal
 - Source and target directory must be different
 
