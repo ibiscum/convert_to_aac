@@ -1,5 +1,4 @@
 import Foundation
-import Logging
 
 @main
 struct ConvertToAAC {
@@ -8,15 +7,7 @@ struct ConvertToAAC {
 
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
-        let logLevel: Logger.Level = args.contains("-d") ? .debug : .info
-        LoggingSystem.bootstrap { label in
-            var handler = StreamLogHandler.standardError(label: label)
-            handler.logLevel = logLevel
-            return handler
-        }
-
-        var logger = Logger(label: "convert_to_aac")
-        logger.logLevel = logLevel
+        let logger = Logger(level: args.contains("-d") ? .debug : .info)
 
         do {
             switch try parseCommand(args) {
@@ -51,8 +42,17 @@ struct ConvertToAAC {
         }
 
         let ffmpegURL = findExecutable(named: "ffmpeg")
+        let ffprobeURL = findExecutable(named: "ffprobe")
+        let atomicParsleyURL = findExecutable(named: "AtomicParsley")
+
+        if ffprobeURL == nil {
+            logger.warning("ffprobe not found; metadata extraction will be skipped")
+        }
+        if atomicParsleyURL == nil {
+            logger.warning("AtomicParsley not found; metadata injection will be skipped")
+        }
         if ffmpegURL == nil {
-            logger.warning("ffmpeg not found; metadata and cover art will not be preserved")
+            logger.warning("ffmpeg not found; MP3/FLAC cover art transfer will be skipped")
         }
 
         if !config.dryRun {
@@ -132,7 +132,14 @@ struct ConvertToAAC {
             do {
                 switch action {
                 case .convertToM4A:
-                    try convertToAAC(source: fileURL, target: outputURL, ffmpegURL: ffmpegURL, logger: logger)
+                    try convertToAAC(
+                        source: fileURL,
+                        target: outputURL,
+                        ffmpegURL: ffmpegURL,
+                        ffprobeURL: ffprobeURL,
+                        atomicParsleyURL: atomicParsleyURL,
+                        logger: logger
+                    )
                     convertedFiles += 1
                 case .copyAAC:
                     if fileManager.fileExists(atPath: outputURL.path) {
@@ -160,39 +167,55 @@ struct ConvertToAAC {
         }
     }
 
-    private static func convertToAAC(source: URL, target: URL, ffmpegURL: URL?, logger: Logger) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
-
+    private static func convertToAAC(
+        source: URL,
+        target: URL,
+        ffmpegURL: URL?,
+        ffprobeURL: URL?,
+        atomicParsleyURL: URL?,
+        logger: Logger
+    ) throws {
         // Use AAC-LC in an M4A container and VBR highest quality.
-        process.arguments = [
+        let afconvertResult = try runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/afconvert"),
+            arguments: [
             "-f", "m4af",
             "-d", "aac",
-            "-u", "vbrq", "127",
+            "-b", "256000",
+            "-s", "2",
+            "-q", "127",
             source.path,
             target.path,
-        ]
+            ],
+            captureOutput: false
+        )
 
-        let pipe = Pipe()
-        process.standardError = pipe
-        process.standardOutput = pipe
-
-        let renderedArgs = process.arguments?.joined(separator: " ") ?? ""
+        let renderedArgs = [
+            "-f", "m4af",
+            "-d", "aac",
+            "-s", "3",
+            "-q", "127",
+            source.path,
+            target.path,
+        ].joined(separator: " ")
         logger.debug("Running: /usr/bin/afconvert \(renderedArgs)")
 
-        try process.run()
-        process.waitUntilExit()
-
-        if process.terminationStatus != 0 {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? "afconvert failed with unknown error"
-            throw CLIError(output.trimmingCharacters(in: .whitespacesAndNewlines))
+        if afconvertResult.terminationStatus != 0 {
+            throw CLIError(afconvertResult.output.isEmpty ? "afconvert failed with unknown error" : afconvertResult.output)
         }
 
-        // Transfer metadata/artwork from the source file without re-encoding.
-        if let ffmpegURL = ffmpegURL {
+        // Transfer metadata using AtomicParsley. For MP3/FLAC, try to extract and inject artwork too.
+        if let ffprobeURL = ffprobeURL, let atomicParsleyURL = atomicParsleyURL {
+            logger.debug("Audio conversion finished for \(source.path); starting metadata transfer")
             do {
-                try transferMetadata(source: source, target: target, ffmpegURL: ffmpegURL, logger: logger)
+                try transferMetadata(
+                    source: source,
+                    target: target,
+                    ffmpegURL: ffmpegURL,
+                    ffprobeURL: ffprobeURL,
+                    atomicParsleyURL: atomicParsleyURL,
+                    logger: logger
+                )
             } catch {
                 logger.warning("Metadata transfer failed: \(error.localizedDescription)")
             }
@@ -237,48 +260,267 @@ struct ConvertToAAC {
         return nil
     }
 
-    private static func transferMetadata(source: URL, target: URL, ffmpegURL: URL, logger: Logger) throws {
-        let fileManager = FileManager.default
-        let tempURL = target.deletingPathExtension().appendingPathExtension("tmp.m4a")
-
-        if fileManager.fileExists(atPath: tempURL.path) {
-            try fileManager.removeItem(at: tempURL)
+    private static func transferMetadata(
+        source: URL,
+        target: URL,
+        ffmpegURL: URL?,
+        ffprobeURL: URL,
+        atomicParsleyURL: URL,
+        logger: Logger
+    ) throws {
+        let sourceExt = source.pathExtension.lowercased()
+        guard sourceExt == "mp3" || sourceExt == "flac" else {
+            return
         }
 
+        logger.debug("Metadata step: extracting tags from \(source.path)")
+        let tags = try extractStandardTags(from: source, ffprobeURL: ffprobeURL)
+        var atomicParsleyArgs = [target.path]
+
+        appendAtomicParsleyTagArguments(from: tags, into: &atomicParsleyArgs)
+
+        var temporaryArtworkURL: URL?
+        if (sourceExt == "mp3" || sourceExt == "flac"), let ffmpegURL = ffmpegURL {
+            logger.debug("Metadata step: extracting artwork from \(source.path)")
+            do {
+                temporaryArtworkURL = try extractArtworkFromSource(source: source, ffmpegURL: ffmpegURL)
+                if let artworkURL = temporaryArtworkURL {
+                    atomicParsleyArgs.append(contentsOf: ["--artwork", artworkURL.path])
+                } else {
+                    logger.warning("No embedded cover art found in \(source.path); continuing with other metadata")
+                }
+            } catch {
+                logger.warning("Artwork extraction failed; continuing without artwork: \(error.localizedDescription)")
+            }
+        }
+
+        atomicParsleyArgs.append("--overWrite")
+
+        defer {
+            if let temporaryArtworkURL {
+                try? FileManager.default.removeItem(at: temporaryArtworkURL)
+            }
+        }
+
+        let artworkInjected = temporaryArtworkURL != nil
+        logger.debug("Metadata step: artwork injection for \(target.path): \(artworkInjected ? "enabled" : "disabled")")
+
+        logger.debug("Running metadata transfer with AtomicParsley: \(atomicParsleyURL.path) \(atomicParsleyArgs.joined(separator: " "))")
+
+        let result = try runProcess(
+            executableURL: atomicParsleyURL,
+            arguments: atomicParsleyArgs,
+            timeoutSeconds: 30
+        )
+        if result.terminationStatus != 0 {
+            throw CLIError(result.output.isEmpty ? "AtomicParsley failed with unknown error" : result.output)
+        }
+
+        logger.debug("Metadata step: AtomicParsley finished for \(target.path)")
+    }
+
+    private static func extractStandardTags(from source: URL, ffprobeURL: URL) throws -> [String: String] {
+        let result = try runProcess(
+            executableURL: ffprobeURL,
+            arguments: [
+                "-v", "error",
+                "-show_entries", "format_tags",
+                "-of", "json",
+                source.path,
+            ],
+            timeoutSeconds: 20
+        )
+
+        if result.terminationStatus != 0 {
+            throw CLIError(result.output.isEmpty ? "ffprobe failed with unknown error" : result.output)
+        }
+
+        guard let data = result.output.data(using: .utf8) else {
+            return [:]
+        }
+
+        let decoded = try JSONDecoder().decode(FFprobeMetadata.self, from: data)
+        return decoded.format?.tags ?? [:]
+    }
+
+    private static func appendAtomicParsleyTagArguments(from rawTags: [String: String], into args: inout [String]) {
+        let tags = Dictionary(uniqueKeysWithValues: rawTags.map { ($0.key.lowercased(), $0.value) })
+
+        func value(_ keys: [String]) -> String? {
+            for key in keys {
+                if let candidate = tags[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !candidate.isEmpty {
+                    return candidate
+                }
+            }
+            return nil
+        }
+
+        if let title = value(["title"]) {
+            args.append(contentsOf: ["--title", title])
+        }
+        if let artist = value(["artist"]) {
+            args.append(contentsOf: ["--artist", artist])
+        }
+        if let album = value(["album"]) {
+            args.append(contentsOf: ["--album", album])
+        }
+        if let albumArtist = value(["album_artist", "albumartist"]) {
+            args.append(contentsOf: ["--albumArtist", albumArtist])
+        }
+        if let composer = value(["composer"]) {
+            args.append(contentsOf: ["--composer", composer])
+        }
+        if let genre = value(["genre"]) {
+            args.append(contentsOf: ["--genre", genre])
+        }
+        if let comment = value(["comment", "description"]) {
+            args.append(contentsOf: ["--comment", comment])
+        }
+        if let lyrics = value(["lyrics", "unsyncedlyrics"]) {
+            args.append(contentsOf: ["--lyrics", lyrics])
+        }
+        if let track = value(["track", "tracknumber"]) {
+            args.append(contentsOf: ["--tracknum", track])
+        }
+        if let disk = value(["disc", "discnumber"]) {
+            args.append(contentsOf: ["--disk", disk])
+        }
+
+        if let yearOrDate = value(["date", "year"]) {
+            let year = String(yearOrDate.prefix(4))
+            if year.count == 4 {
+                args.append(contentsOf: ["--year", year])
+            }
+        }
+
+        if let compilationRaw = value(["compilation"]) {
+            let normalized = compilationRaw.lowercased()
+            let isCompilation = normalized == "1" || normalized == "true" || normalized == "yes"
+            args.append(contentsOf: ["--compilation", isCompilation ? "true" : "false"])
+        }
+    }
+
+    private static func extractArtworkFromSource(source: URL, ffmpegURL: URL) throws -> URL? {
+        let fileManager = FileManager.default
+        let artworkURL = fileManager.temporaryDirectory
+            .appendingPathComponent("convert_to_aac_artwork_\(UUID().uuidString)")
+            .appendingPathExtension("jpg")
+
+        let result = try runProcess(
+            executableURL: ffmpegURL,
+            arguments: [
+                "-nostdin",
+                "-hide_banner",
+                "-v", "error",
+                "-y",
+                "-i", source.path,
+                "-an",
+                "-map", "0:v:0?",
+                "-frames:v", "1",
+                "-c:v", "mjpeg",
+                artworkURL.path,
+            ],
+            timeoutSeconds: 120
+        )
+
+        if result.terminationStatus != 0 {
+            try? fileManager.removeItem(at: artworkURL)
+            return nil
+        }
+
+        guard fileManager.fileExists(atPath: artworkURL.path) else {
+            return nil
+        }
+
+        let attributes = try? fileManager.attributesOfItem(atPath: artworkURL.path)
+        let fileSize = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        if fileSize == 0 {
+            try? fileManager.removeItem(at: artworkURL)
+            return nil
+        }
+
+        return artworkURL
+    }
+
+    private static func runProcess(
+        executableURL: URL,
+        arguments: [String],
+        captureOutput: Bool = true,
+        timeoutSeconds: TimeInterval? = nil
+    ) throws -> ProcessResult {
         let process = Process()
-        process.executableURL = ffmpegURL
-        process.arguments = [
-            "-y",
-            "-i", target.path,
-            "-i", source.path,
-            "-map", "0:a",
-            "-map_metadata", "1",
-            "-c:a", "copy",
-            "-movflags", "+faststart",
-            tempURL.path,
-        ]
+        process.executableURL = executableURL
+        process.arguments = arguments
 
-        let pipe = Pipe()
-        process.standardError = pipe
-        process.standardOutput = pipe
+        var stdoutURL: URL?
+        var stderrURL: URL?
+        var stdoutHandle: FileHandle?
+        var stderrHandle: FileHandle?
 
-        let renderedArgs = process.arguments?.joined(separator: " ") ?? ""
-        logger.debug("Running metadata transfer: \(ffmpegURL.path) \(renderedArgs)")
+        if captureOutput {
+            let tempDir = FileManager.default.temporaryDirectory
+            stdoutURL = tempDir.appendingPathComponent("convert_to_aac_stdout_\(UUID().uuidString).log")
+            stderrURL = tempDir.appendingPathComponent("convert_to_aac_stderr_\(UUID().uuidString).log")
+
+            guard
+                let stdoutURL,
+                let stderrURL,
+                FileManager.default.createFile(atPath: stdoutURL.path, contents: nil),
+                FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+            else {
+                throw CLIError("Failed to create temporary files for process output capture")
+            }
+
+            stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
+            stderrHandle = try FileHandle(forWritingTo: stderrURL)
+            process.standardOutput = stdoutHandle
+            process.standardError = stderrHandle
+        } else {
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+        }
+
+        defer {
+            try? stdoutHandle?.close()
+            try? stderrHandle?.close()
+            if let stdoutURL {
+                try? FileManager.default.removeItem(at: stdoutURL)
+            }
+            if let stderrURL {
+                try? FileManager.default.removeItem(at: stderrURL)
+            }
+        }
 
         try process.run()
-        process.waitUntilExit()
 
-        if process.terminationStatus != 0 {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? "ffmpeg failed with unknown error"
-            try? fileManager.removeItem(at: tempURL)
-            throw CLIError(output.trimmingCharacters(in: .whitespacesAndNewlines))
+        if let timeoutSeconds {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while process.isRunning, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+                throw CLIError("Timed out after \(Int(timeoutSeconds))s running \(executableURL.lastPathComponent)")
+            }
+        } else {
+            process.waitUntilExit()
         }
 
-        if fileManager.fileExists(atPath: target.path) {
-            try fileManager.removeItem(at: target)
+        var outputData = Data()
+        if captureOutput {
+            if let stdoutURL, let stdoutChunk = try? Data(contentsOf: stdoutURL) {
+                outputData.append(stdoutChunk)
+            }
+            if let stderrURL, let stderrChunk = try? Data(contentsOf: stderrURL) {
+                outputData.append(stderrChunk)
+            }
         }
-        try fileManager.moveItem(at: tempURL, to: target)
+
+        let output = String(data: outputData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return ProcessResult(terminationStatus: process.terminationStatus, output: output)
     }
 
     static func parseCommand(_ args: [String]) throws -> ParsedCommand {
@@ -322,7 +564,7 @@ struct ConvertToAAC {
 
         Recursively scans <source_dir> for .mp3, .flac, .aac, and .m4a files.
         .mp3/.flac are converted to AAC (.m4a); .aac/.m4a are copied as-is.
-        Metadata and embedded cover art are transferred using ffmpeg when available.
+        Metadata tags are transferred via ffprobe + AtomicParsley; artwork extraction uses ffmpeg.
         The directory structure is mirrored under <target_dir>.
 
         Options:
@@ -424,6 +666,46 @@ enum SourceAction {
     case copyAAC
 }
 
+struct Logger {
+    enum Level: String {
+        case debug = "DEBUG"
+        case info = "INFO"
+        case warning = "WARNING"
+        case error = "ERROR"
+    }
+
+    var logLevel: Level
+
+    init(level: Level) {
+        self.logLevel = level
+    }
+
+    private func shouldLog(_ level: Level) -> Bool {
+        let order: [Level] = [.debug, .info, .warning, .error]
+        guard let currentIndex = order.firstIndex(of: logLevel),
+              let messageIndex = order.firstIndex(of: level) else {
+            return false
+        }
+        return messageIndex >= currentIndex
+    }
+
+    private func log(_ level: Level, _ message: String) {
+        guard shouldLog(level) else { return }
+        var parts: [String] = []
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        parts.append(formatter.string(from: Date()))
+        parts.append(level.rawValue)
+        parts.append(message)
+        FileHandle.standardError.write((parts.joined(separator: ": ") + "\n").data(using: .utf8)!)
+    }
+
+    func debug(_ message: String) { log(.debug, message) }
+    func info(_ message: String) { log(.info, message) }
+    func warning(_ message: String) { log(.warning, message) }
+    func error(_ message: String) { log(.error, message) }
+}
+
 struct Config {
     let debug: Bool
     let dryRun: Bool
@@ -431,10 +713,27 @@ struct Config {
     let targetDirectory: String
 }
 
-struct CLIError: Error {
+struct CLIError: Error, LocalizedError {
     let message: String
 
     init(_ message: String) {
         self.message = message
     }
+
+    var errorDescription: String? {
+        message
+    }
+}
+
+struct ProcessResult {
+    let terminationStatus: Int32
+    let output: String
+}
+
+struct FFprobeMetadata: Decodable {
+    let format: FFprobeFormat?
+}
+
+struct FFprobeFormat: Decodable {
+    let tags: [String: String]?
 }
