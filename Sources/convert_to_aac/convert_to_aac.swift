@@ -181,6 +181,9 @@ struct ConvertToAAC {
             arguments: [
             "-f", "m4af",
             "-d", "aac",
+            "-l", "Stereo",
+            "-l", "Stereo",
+            "-ch", "2",
             "-b", "256000",
             "-s", "2",
             "-q", "127",
@@ -193,7 +196,11 @@ struct ConvertToAAC {
         let renderedArgs = [
             "-f", "m4af",
             "-d", "aac",
-            "-s", "3",
+            "-l", "Stereo",
+            "-l", "Stereo",
+            "-ch", "2",
+            "-b", "256000",
+            "-s", "2",
             "-q", "127",
             source.path,
             target.path,

@@ -22,6 +22,22 @@ Recursive audio processor for macOS that scans a source directory, converts .mp3
 swift build
 ```
 
+Build an optimized release binary:
+
+```bash
+swift build -c release
+```
+
+The resulting executable is:
+
+- `.build/release/convert_to_aac`
+
+Install it system-wide (example: `/usr/local/bin`):
+
+```bash
+sudo install -m 0755 .build/release/convert_to_aac /usr/local/bin/convert_to_aac
+```
+
 ## Tests
 
 Run all tests:
@@ -41,7 +57,7 @@ The test suite includes:
 ## Usage
 
 ```bash
-swift run convert_to_aac [-d] [-n] <source_dir> <target_dir>
+convert_to_aac [-d] [-n] <source_dir> <target_dir>
 ```
 
 ### Options
@@ -56,7 +72,7 @@ If called with invalid options or insufficient arguments, the program prints a s
 
 - Input extensions matched case-insensitively: .mp3, .flac, .aac, .m4a
 - Converted output extension: .m4a
-- Output codec settings: AAC-LC with high quality settings (afconvert -b 256000 -s 2 -q 127)
+- Output codec settings: AAC-LC with high quality settings (afconvert -f m4af -d aac -ch 2 -b 256000 -s 2 -q 127)
 - .aac and .m4a source files are copied to target path without conversion
 - Metadata transfer runs only for converted .mp3 and .flac inputs (not for copied .aac/.m4a files)
 - Metadata tags are read with ffprobe and written to the output .m4a with AtomicParsley
@@ -103,6 +119,7 @@ Notes:
 The converter uses macOS `afconvert` with these audio settings for `.mp3` and `.flac` inputs:
 
 - Codec and container: AAC-LC in `.m4a` (`-f m4af -d aac`)
+- Channels: stereo output (`-ch 2`)
 - Target bitrate: `256 kbps` (`-b 256000`)
 - Encoder quality: highest quality value (`-q 127`)
 - Strategy: `-s 2` (high-quality AAC encoding strategy in `afconvert`)
@@ -124,19 +141,19 @@ Important quality notes:
 Dry run to preview what would be converted:
 
 ```bash
-swift run convert_to_aac -n /Volumes/MusicLibrary /Volumes/AACLibrary
+convert_to_aac -n /Volumes/MusicLibrary /Volumes/AACLibrary
 ```
 
 Convert with debug logs:
 
 ```bash
-swift run convert_to_aac -d /Volumes/MusicLibrary /Volumes/AACLibrary
+convert_to_aac -d /Volumes/MusicLibrary /Volumes/AACLibrary
 ```
 
 Show help:
 
 ```bash
-swift run convert_to_aac -h
+convert_to_aac -h
 ```
 
 ## Path Mirroring Example
