@@ -287,6 +287,9 @@ struct ConvertToAAC {
         appendAtomicParsleyTagArguments(from: tags, into: &atomicParsleyArgs)
 
         var temporaryArtworkURL: URL?
+        let temporaryTaggedOutputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("convert_to_aac_tagged_\(UUID().uuidString)")
+            .appendingPathExtension("m4a")
         if (sourceExt == "mp3" || sourceExt == "flac"), let ffmpegURL = ffmpegURL {
             logger.debug("Metadata step: extracting artwork from \(source.path)")
             do {
@@ -301,12 +304,13 @@ struct ConvertToAAC {
             }
         }
 
-        atomicParsleyArgs.append("--overWrite")
+        atomicParsleyArgs.append(contentsOf: ["--output", temporaryTaggedOutputURL.path])
 
         defer {
             if let temporaryArtworkURL {
                 try? FileManager.default.removeItem(at: temporaryArtworkURL)
             }
+            try? FileManager.default.removeItem(at: temporaryTaggedOutputURL)
         }
 
         let artworkInjected = temporaryArtworkURL != nil
@@ -321,6 +325,23 @@ struct ConvertToAAC {
         )
         if result.terminationStatus != 0 {
             throw CLIError(result.output.isEmpty ? "AtomicParsley failed with unknown error" : result.output)
+        }
+
+        guard FileManager.default.fileExists(atPath: temporaryTaggedOutputURL.path) else {
+            throw CLIError("AtomicParsley did not produce output file at \(temporaryTaggedOutputURL.path)")
+        }
+
+        logger.debug("Metadata step: replacing target via temp-output path: \(temporaryTaggedOutputURL.path) -> \(target.path)")
+
+        do {
+            _ = try FileManager.default.replaceItemAt(
+                target,
+                withItemAt: temporaryTaggedOutputURL,
+                backupItemName: nil,
+                options: []
+            )
+        } catch {
+            throw CLIError("Metadata retag output replace failed for \(target.path): \(error.localizedDescription)")
         }
 
         logger.debug("Metadata step: AtomicParsley finished for \(target.path)")
@@ -572,7 +593,7 @@ struct ConvertToAAC {
         Recursively scans <source_dir> for .mp3, .flac, .aac, and .m4a files.
         .mp3/.flac are converted to AAC (.m4a); .aac/.m4a are copied as-is.
         Metadata tags are transferred via ffprobe + AtomicParsley; artwork extraction uses ffmpeg.
-        The directory structure is mirrored under <target_dir>.
+        The directory structure is mirrored under <target_dir>/<source_dir_name>.
 
         Options:
           -d    Enable debug output
@@ -613,7 +634,11 @@ struct ConvertToAAC {
         case .copyAAC:
             outputRelative = relativePath
         }
-        return targetRoot.standardizedFileURL.appendingPathComponent(outputRelative)
+        let sourceRootName = sourceRoot.standardizedFileURL.lastPathComponent
+        return targetRoot
+            .standardizedFileURL
+            .appendingPathComponent(sourceRootName)
+            .appendingPathComponent(outputRelative)
     }
 
     static func shouldSkipConversion(

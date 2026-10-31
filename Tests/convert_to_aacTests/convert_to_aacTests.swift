@@ -58,7 +58,7 @@ import Foundation
             targetRoot: targetRoot,
             action: .convertToM4A
         )
-        #expect(output.path == "/output/artist/album/track01.m4a")
+        #expect(output.path == "/output/input/artist/album/track01.m4a")
     }
 
 @Test func outputURLMirrorsStructureForCopyAAC() throws {
@@ -72,7 +72,7 @@ import Foundation
             targetRoot: targetRoot,
             action: .copyAAC
         )
-        #expect(output.path == "/output/artist/album/track01.aac")
+        #expect(output.path == "/output/input/artist/album/track01.aac")
     }
 
 @Test func outputURLRejectsFilesOutsideSourceRoot() {

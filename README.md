@@ -1,13 +1,13 @@
 # convert_to_aac
 
-Recursive audio processor for macOS that scans a source directory, converts .mp3/.flac files to AAC (.m4a), and copies existing .aac/.m4a files while mirroring the original folder structure in a target directory.
+Recursive audio processor for macOS that scans a source directory, converts .mp3/.flac files to AAC (.m4a), and copies existing .aac/.m4a files while mirroring the original folder structure under a source-named folder inside the target directory.
 
 ## Features
 
 - Recursively scans a source directory tree
 - Converts .mp3 and .flac inputs to AAC in .m4a container
 - Copies .aac and .m4a source files without re-encoding
-- Mirrors relative paths and filenames under the target directory
+- Mirrors relative paths and filenames under <target_dir>/<source_dir_name>
 - Supports dry run mode to preview actions
 - Supports debug mode for verbose logging
 
@@ -89,9 +89,9 @@ For each converted .mp3/.flac file, processing happens in this order:
 
 1. afconvert creates the AAC .m4a audio file.
 2. ffprobe reads source tags (JSON output).
-3. AtomicParsley writes supported tags into the .m4a file.
+3. AtomicParsley writes supported tags into a temporary .m4a output file.
 4. ffmpeg attempts to extract the first embedded image stream as a temporary JPEG.
-5. AtomicParsley injects that image as artwork, then temporary files are removed.
+5. AtomicParsley injects that image as artwork into the same temporary .m4a output, and the temporary tagged file atomically replaces the target .m4a.
 
 Supported tag mapping includes:
 
@@ -166,4 +166,4 @@ Given:
 
 The output file will be:
 
-- /music/aac/artist/album/track01.m4a
+- /music/aac/src/artist/album/track01.m4a
