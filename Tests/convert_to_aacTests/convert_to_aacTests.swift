@@ -200,6 +200,53 @@ import Foundation
         #expect(ConvertToAAC.isAACMetadataOutput("not an afinfo output") == false)
     }
 
+@Test func isFLACMetadataOutputRegression() {
+        let validOutput = """
+        File: /tmp/sample.flac
+        File type ID: flac
+        Data format: 2 ch, 44100 Hz, 'flac' (0x00000000)
+        """
+
+        let invalidOutput = """
+        File: /tmp/sample.wav
+        Data format: 2 ch, 44100 Hz, 'lpcm' (0x00000000)
+        """
+
+        #expect(ConvertToAAC.isFLACMetadataOutput(validOutput) == true)
+        #expect(ConvertToAAC.isFLACMetadataOutput(invalidOutput) == false)
+        #expect(ConvertToAAC.isFLACMetadataOutput("not an afinfo output") == false)
+    }
+
+@Test func hasAudioDataMetadataAcceptsPositiveDurationAndByteCount() {
+        let output = """
+        File: /tmp/sample.m4a
+        estimated duration: 217.147755 sec
+        audio data byte count: 6929518
+        """
+
+        #expect(ConvertToAAC.hasAudioDataMetadata(output) == true)
+    }
+
+@Test func hasAudioDataMetadataRejectsZeroDuration() {
+        let output = """
+        File: /tmp/sample.m4a
+        estimated duration: 0.000000 sec
+        audio data byte count: 6929518
+        """
+
+        #expect(ConvertToAAC.hasAudioDataMetadata(output) == false)
+    }
+
+@Test func hasAudioDataMetadataRejectsMissingAudioIndicators() {
+        let output = """
+        File: /tmp/sample.m4a
+        File type ID: m4af
+        Data format: 2 ch, 44100 Hz, 'aac ' (0x00000000)
+        """
+
+        #expect(ConvertToAAC.hasAudioDataMetadata(output) == false)
+    }
+
 @Test func integrationMissingArgumentsPrintsErrorAndUsageToStderr() throws {
         let executableURL = try builtExecutableURL(named: "convert_to_aac")
         let process = Process()
@@ -229,6 +276,14 @@ import Foundation
 @Test func findExecutableReturnsNilForNonExistentBinary() {
     let url = ConvertToAAC.findExecutable(named: "this-binary-does-not-exist-12345")
     #expect(url == nil)
+}
+
+@Test func audioValidationErrorDescriptionsRegression() {
+    let invalidFlac = AudioValidationError.invalidSourceFLAC(path: "/tmp/a.flac")
+    let invalidM4A = AudioValidationError.invalidConvertedM4A(path: "/tmp/a.m4a")
+
+    #expect(invalidFlac.localizedDescription.contains("invalid or has no audio data"))
+    #expect(invalidM4A.localizedDescription.contains("not a valid AAC with audio data"))
 }
 
 private func builtExecutableURL(named executableName: String) throws -> URL {

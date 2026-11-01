@@ -1,4 +1,7 @@
 import Foundation
+import AVFoundation
+import AudioToolbox
+import CFLAC
 
 @main
 struct ConvertToAAC {
@@ -103,7 +106,7 @@ struct ConvertToAAC {
             logger.debug("Target: \(outputURL.path)")
 
             if shouldSkipConversion(targetURL: outputURL, aacValidator: {
-                isValidAACFile(at: $0, logger: logger)
+                isValidAACFileWithAudioData(at: $0, logger: logger)
             }) {
                 skippedFiles += 1
                 if config.dryRun {
@@ -117,7 +120,7 @@ struct ConvertToAAC {
             if config.dryRun {
                 switch action {
                 case .convertToM4A:
-                    logger.info("[dry-run] afconvert '\(fileURL.path)' -> '\(outputURL.path)'")
+                    logger.info("[dry-run] avfoundation-encode '\(fileURL.path)' -> '\(outputURL.path)'")
                 case .copyAAC:
                     logger.info("[dry-run] copy '\(fileURL.path)' -> '\(outputURL.path)'")
                 }
@@ -149,6 +152,8 @@ struct ConvertToAAC {
                     copiedFiles += 1
                     logger.debug("Copied AAC source without conversion: \(fileURL.path)")
                 }
+            } catch let validationError as AudioValidationError {
+                throw CLIError(validationError.localizedDescription)
             } catch {
                 failedFiles += 1
                 logger.error("Failed processing \(fileURL.path): \(error.localizedDescription)")
@@ -175,40 +180,24 @@ struct ConvertToAAC {
         atomicParsleyURL: URL?,
         logger: Logger
     ) throws {
-        // Use AAC-LC in an M4A container and VBR highest quality.
-        let afconvertResult = try runProcess(
-            executableURL: URL(fileURLWithPath: "/usr/bin/afconvert"),
-            arguments: [
-            "-f", "m4af",
-            "-d", "aac",
-            "-l", "Stereo",
-            "-l", "Stereo",
-            "-ch", "2",
-            "-b", "256000",
-            "-s", "2",
-            "-q", "127",
-            source.path,
-            target.path,
-            ],
-            captureOutput: false
-        )
+        logger.debug("Starting conversion: \(source.path) -> \(target.path)")
 
-        let renderedArgs = [
-            "-f", "m4af",
-            "-d", "aac",
-            "-l", "Stereo",
-            "-l", "Stereo",
-            "-ch", "2",
-            "-b", "256000",
-            "-s", "2",
-            "-q", "127",
-            source.path,
-            target.path,
-        ].joined(separator: " ")
-        logger.debug("Running: /usr/bin/afconvert \(renderedArgs)")
+        let sourceExt = source.pathExtension.lowercased()
+        if sourceExt == "flac" {
+            guard isValidFLACFileWithAudioData(at: source, logger: logger) else {
+                throw AudioValidationError.invalidSourceFLAC(path: source.path)
+            }
+        }
 
-        if afconvertResult.terminationStatus != 0 {
-            throw CLIError(afconvertResult.output.isEmpty ? "afconvert failed with unknown error" : afconvertResult.output)
+        do {
+            if sourceExt == "flac" {
+                try convertFLACToAACUsingLibFLAC(source: source, target: target, logger: logger)
+            } else {
+                try convertToAACUsingAVFoundation(source: source, target: target, logger: logger)
+            }
+        } catch {
+            logger.error("Audio conversion failed for \(source.path): \(error.localizedDescription)")
+            throw error
         }
 
         // Transfer metadata using AtomicParsley. For MP3/FLAC, try to extract and inject artwork too.
@@ -227,6 +216,370 @@ struct ConvertToAAC {
                 logger.warning("Metadata transfer failed: \(error.localizedDescription)")
             }
         }
+
+        guard isValidAACFileWithAudioData(at: target, logger: logger) else {
+            throw AudioValidationError.invalidConvertedM4A(path: target.path)
+        }
+    }
+
+    private static func convertToAACUsingAVFoundation(source: URL, target: URL, logger: Logger) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: target.path) {
+            try fileManager.removeItem(at: target)
+        }
+
+        let asset = AVURLAsset(url: source)
+        guard let audioTrack = asset.tracks(withMediaType: .audio).first else {
+            throw CLIError("Source file has no audio track: \(source.path)")
+        }
+        logger.debug("Source track details for \(source.lastPathComponent): \(describeAudioTrack(audioTrack))")
+
+        let reader = try AVAssetReader(asset: asset)
+        let readerOutput = AVAssetReaderTrackOutput(
+            track: audioTrack,
+            outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+            ]
+        )
+        guard reader.canAdd(readerOutput) else {
+            throw CLIError("AVFoundation reader could not attach audio output for \(source.path)")
+        }
+        reader.add(readerOutput)
+
+        let writer = try AVAssetWriter(outputURL: target, fileType: .m4a)
+        let audioSettings = avFoundationAACOutputSettings(for: audioTrack)
+        let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        writerInput.expectsMediaDataInRealTime = false
+
+        guard writer.canAdd(writerInput) else {
+            throw CLIError("AVFoundation writer could not attach AAC input for \(target.path)")
+        }
+        writer.add(writerInput)
+
+        guard writer.startWriting() else {
+            throw CLIError(
+                "AVFoundation failed to start writing \(target.path). \(detailedErrorMessage(writer.error))"
+            )
+        }
+        guard reader.startReading() else {
+            writer.cancelWriting()
+            throw CLIError(
+                "AVFoundation failed to start reading \(source.path). \(detailedErrorMessage(reader.error))"
+            )
+        }
+
+        writer.startSession(atSourceTime: .zero)
+        let conversionDeadline = Date().addingTimeInterval(300)
+        var reachedEndOfInput = false
+
+        while !reachedEndOfInput {
+            if Date() > conversionDeadline {
+                reader.cancelReading()
+                writer.cancelWriting()
+                throw CLIError("Timed out after 300s running AVFoundation conversion for \(source.path)")
+            }
+
+            if writerInput.isReadyForMoreMediaData {
+                if let sampleBuffer = readerOutput.copyNextSampleBuffer() {
+                    if !writerInput.append(sampleBuffer) {
+                        reader.cancelReading()
+                        writer.cancelWriting()
+                        throw CLIError(
+                            "AVFoundation append failed for \(source.path). \(detailedErrorMessage(writer.error))"
+                        )
+                    }
+                } else {
+                    writerInput.markAsFinished()
+                    reachedEndOfInput = true
+                }
+            } else {
+                if reader.status == .failed {
+                    writer.cancelWriting()
+                    throw CLIError(
+                        "AVFoundation read failed for \(source.path). \(detailedErrorMessage(reader.error))"
+                    )
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+
+        let finishSemaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting {
+            finishSemaphore.signal()
+        }
+        if finishSemaphore.wait(timeout: .now() + .seconds(300)) == .timedOut {
+            writer.cancelWriting()
+            throw CLIError("Timed out after 300s finalizing AVFoundation output for \(target.path)")
+        }
+
+        if reader.status == .failed {
+            throw CLIError("AVFoundation read failed for \(source.path). \(detailedErrorMessage(reader.error))")
+        }
+
+        guard writer.status == .completed else {
+            throw CLIError("AVFoundation write failed for \(target.path). \(detailedErrorMessage(writer.error))")
+        }
+
+        logger.debug("Running AVFoundation AAC encode (\(source.path) -> \(target.path)) with settings: \(audioSettings)")
+    }
+
+    private static func convertFLACToAACUsingLibFLAC(source: URL, target: URL, logger: Logger) throws {
+        let decoded = try decodeFLACToPCM16(source: source, logger: logger)
+        try encodePCM16ToM4AUsingCoreAudio(pcm: decoded, target: target)
+        logger.debug(
+            "Running libFLAC decode + CoreAudio AAC encode (\(source.path) -> \(target.path)); " +
+            "sampleRate=\(decoded.sampleRate), channels=\(decoded.channels), frames=\(decoded.totalFrames)"
+        )
+    }
+
+    private static func decodeFLACToPCM16(source: URL, logger: Logger) throws -> DecodedPCM16 {
+        guard let decoder = FLAC__stream_decoder_new() else {
+            throw CLIError("libFLAC failed to initialize decoder for \(source.path)")
+        }
+        defer {
+            FLAC__stream_decoder_delete(decoder)
+        }
+
+        let state = FLACDecoderState()
+        let initStatus = source.path.withCString { sourceCString in
+            FLAC__stream_decoder_init_file(
+                decoder,
+                sourceCString,
+                flacWriteCallback,
+                flacMetadataCallback,
+                flacErrorCallback,
+                Unmanaged.passUnretained(state).toOpaque()
+            )
+        }
+        guard initStatus == FLAC__STREAM_DECODER_INIT_STATUS_OK else {
+            throw CLIError("libFLAC failed to open \(source.path): init status \(initStatus.rawValue)")
+        }
+
+        guard FLAC__stream_decoder_process_until_end_of_stream(decoder) != 0 else {
+            throw CLIError("libFLAC failed while decoding \(source.path)")
+        }
+
+        guard let sampleRate = state.sampleRate, sampleRate > 0 else {
+            throw CLIError("libFLAC did not report sample rate for \(source.path)")
+        }
+        guard let channels = state.channels, channels > 0 else {
+            throw CLIError("libFLAC did not report channel count for \(source.path)")
+        }
+
+        if !state.decodeErrorMessages.isEmpty {
+            logger.warning("libFLAC decode warnings for \(source.path): \(state.decodeErrorMessages.joined(separator: ", "))")
+        }
+
+        let bytesPerFrame = Int(channels) * MemoryLayout<Int16>.size
+        let totalFrames = state.pcmData.count / bytesPerFrame
+        guard totalFrames > 0 else {
+            throw CLIError("libFLAC produced no PCM frames for \(source.path)")
+        }
+
+        return DecodedPCM16(
+            sampleRate: Double(sampleRate),
+            channels: channels,
+            pcmData: state.pcmData,
+            totalFrames: totalFrames
+        )
+    }
+
+    private static func encodePCM16ToM4AUsingCoreAudio(pcm: DecodedPCM16, target: URL) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: target.path) {
+            try fileManager.removeItem(at: target)
+        }
+
+        let bytesPerSample = UInt32(MemoryLayout<Int16>.size)
+        let bytesPerFrame = pcm.channels * bytesPerSample
+
+        var clientFormat = AudioStreamBasicDescription(
+            mSampleRate: pcm.sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: bytesPerFrame,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: bytesPerFrame,
+            mChannelsPerFrame: pcm.channels,
+            mBitsPerChannel: 16,
+            mReserved: 0
+        )
+
+        var outputFormat = AudioStreamBasicDescription(
+            mSampleRate: pcm.sampleRate,
+            mFormatID: kAudioFormatMPEG4AAC,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: 1024,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: pcm.channels,
+            mBitsPerChannel: 0,
+            mReserved: 0
+        )
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try checkOSStatus(
+            AudioFormatGetProperty(
+                kAudioFormatProperty_FormatInfo,
+                0,
+                nil,
+                &formatSize,
+                &outputFormat
+            ),
+            context: "AudioFormatGetProperty(kAudioFormatProperty_FormatInfo)"
+        )
+
+        var outputFile: ExtAudioFileRef?
+        try checkOSStatus(
+            ExtAudioFileCreateWithURL(
+                target as CFURL,
+                kAudioFileM4AType,
+                &outputFormat,
+                nil,
+                AudioFileFlags.eraseFile.rawValue,
+                &outputFile
+            ),
+            context: "ExtAudioFileCreateWithURL(\(target.path))"
+        )
+        guard let outputFile else {
+            throw CLIError("CoreAudio failed to create output file for \(target.path)")
+        }
+        defer {
+            ExtAudioFileDispose(outputFile)
+        }
+
+        try checkOSStatus(
+            ExtAudioFileSetProperty(
+                outputFile,
+                kExtAudioFileProperty_ClientDataFormat,
+                UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+                &clientFormat
+            ),
+            context: "ExtAudioFileSetProperty(kExtAudioFileProperty_ClientDataFormat)"
+        )
+
+        var converter: AudioConverterRef?
+        var converterSize = UInt32(MemoryLayout<AudioConverterRef?>.size)
+        try checkOSStatus(
+            ExtAudioFileGetProperty(
+                outputFile,
+                kExtAudioFileProperty_AudioConverter,
+                &converterSize,
+                &converter
+            ),
+            context: "ExtAudioFileGetProperty(kExtAudioFileProperty_AudioConverter)"
+        )
+        guard let converter else {
+            throw CLIError("CoreAudio did not provide an AudioConverter for \(target.path)")
+        }
+
+        var bitRateControlMode = UInt32(kAudioCodecBitRateControlMode_VariableConstrained)
+        try checkOSStatus(
+            AudioConverterSetProperty(
+                converter,
+                kAudioCodecPropertyBitRateControlMode,
+                UInt32(MemoryLayout<UInt32>.size),
+                &bitRateControlMode
+            ),
+            context: "AudioConverterSetProperty(kAudioCodecPropertyBitRateControlMode)"
+        )
+
+        var vbrQuality: UInt32 = 127
+        try checkOSStatus(
+            AudioConverterSetProperty(
+                converter,
+                kAudioCodecPropertySoundQualityForVBR,
+                UInt32(MemoryLayout<UInt32>.size),
+                &vbrQuality
+            ),
+            context: "AudioConverterSetProperty(kAudioCodecPropertySoundQualityForVBR)"
+        )
+
+        var codecQuality: UInt32 = 127
+        try checkOSStatus(
+            AudioConverterSetProperty(
+                converter,
+                kAudioConverterCodecQuality,
+                UInt32(MemoryLayout<UInt32>.size),
+                &codecQuality
+            ),
+            context: "AudioConverterSetProperty(kAudioConverterCodecQuality)"
+        )
+
+        var targetBitRate: UInt32 = 256_000
+        try checkOSStatus(
+            AudioConverterSetProperty(
+                converter,
+                kAudioConverterEncodeBitRate,
+                UInt32(MemoryLayout<UInt32>.size),
+                &targetBitRate
+            ),
+            context: "AudioConverterSetProperty(kAudioConverterEncodeBitRate)"
+        )
+
+        let chunkFrames = 4096
+        let totalFrames = pcm.totalFrames
+        let bytesPerFrameInt = Int(bytesPerFrame)
+
+        try pcm.pcmData.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                throw CLIError("Decoded PCM buffer is empty")
+            }
+
+            var frameOffset = 0
+            while frameOffset < totalFrames {
+                let framesToWrite = min(chunkFrames, totalFrames - frameOffset)
+                let byteOffset = frameOffset * bytesPerFrameInt
+                let byteCount = framesToWrite * bytesPerFrameInt
+                let chunkPointer = baseAddress.advanced(by: byteOffset)
+
+                let audioBuffer = AudioBuffer(
+                    mNumberChannels: pcm.channels,
+                    mDataByteSize: UInt32(byteCount),
+                    mData: UnsafeMutableRawPointer(mutating: chunkPointer)
+                )
+                var bufferList = AudioBufferList(mNumberBuffers: 1, mBuffers: audioBuffer)
+                try checkOSStatus(
+                    ExtAudioFileWrite(outputFile, UInt32(framesToWrite), &bufferList),
+                    context: "ExtAudioFileWrite(\(target.path))"
+                )
+
+                frameOffset += framesToWrite
+            }
+        }
+    }
+
+    private static func avFoundationAACOutputSettings(for track: AVAssetTrack) -> [String: Any] {
+        var sampleRate: Double = 44_100
+        var channels = 2
+
+        for formatDescription in track.formatDescriptions {
+            let audioFormat = formatDescription as! CMAudioFormatDescription
+            guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?
+                    .pointee else {
+                continue
+            }
+
+            if streamDescription.mSampleRate > 0 {
+                sampleRate = streamDescription.mSampleRate
+            }
+            if streamDescription.mChannelsPerFrame > 0 {
+                channels = Int(streamDescription.mChannelsPerFrame)
+            }
+            break
+        }
+
+        let normalizedChannels = min(max(channels, 1), 2)
+
+        return [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVEncoderBitRateKey: 256_000,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: normalizedChannels,
+        ]
     }
 
     static func findExecutable(named name: String) -> URL? {
@@ -530,7 +883,8 @@ struct ConvertToAAC {
             if process.isRunning {
                 process.terminate()
                 process.waitUntilExit()
-                throw CLIError("Timed out after \(Int(timeoutSeconds))s running \(executableURL.lastPathComponent)")
+                let command = ([executableURL.path] + arguments).joined(separator: " ")
+                throw CLIError("Timed out after \(Int(timeoutSeconds))s running command: \(command)")
             }
         } else {
             process.waitUntilExit()
@@ -660,7 +1014,52 @@ struct ConvertToAAC {
         return normalized.contains("aac")
     }
 
-    static func isValidAACFile(at fileURL: URL, logger: Logger) -> Bool {
+    static func isFLACMetadataOutput(_ output: String) -> Bool {
+        let normalized = output.lowercased()
+        let hasDataFormat = normalized.contains("data format")
+        let hasFLACMarker = normalized.contains("flac") || normalized.contains("fla c")
+        return hasDataFormat && hasFLACMarker
+    }
+
+    static func hasAudioDataMetadata(_ output: String) -> Bool {
+        let lines = output
+            .lowercased()
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        func firstNumericValue(in line: String) -> Double? {
+            let pattern = #"-?[0-9]+(?:\.[0-9]+)?"#
+            guard let regex = try? NSRegularExpression(pattern: pattern) else {
+                return nil
+            }
+
+            let nsRange = NSRange(line.startIndex..<line.endIndex, in: line)
+            guard let match = regex.firstMatch(in: line, range: nsRange),
+                  let range = Range(match.range, in: line) else {
+                return nil
+            }
+
+            return Double(line[range])
+        }
+
+        let durationLine = lines.first { $0.contains("estimated duration") || $0.contains("duration") }
+        let audioByteCountLine = lines.first { $0.contains("audio data byte count") }
+
+        let duration = durationLine.flatMap(firstNumericValue)
+        let audioByteCount = audioByteCountLine.flatMap(firstNumericValue)
+
+        if let duration, duration <= 0 {
+            return false
+        }
+
+        if let audioByteCount, audioByteCount <= 0 {
+            return false
+        }
+
+        return duration != nil || audioByteCount != nil
+    }
+
+    static func isValidAACFileWithAudioData(at fileURL: URL, logger: Logger) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/afinfo")
         process.arguments = [fileURL.path]
@@ -677,15 +1076,217 @@ struct ConvertToAAC {
 
             if process.terminationStatus != 0 {
                 logger.debug("afinfo reported non-AAC or unreadable file: \(fileURL.path)")
+                logger.debug("afinfo excerpt: \(afinfoExcerpt(output))")
                 return false
             }
 
-            return isAACMetadataOutput(output)
+            guard isAACMetadataOutput(output) else {
+                logger.debug("afinfo did not report AAC format for \(fileURL.path)")
+                logger.debug("afinfo excerpt: \(afinfoExcerpt(output))")
+                return false
+            }
+
+            guard hasAudioDataMetadata(output) else {
+                logger.debug("afinfo did not report playable audio data for \(fileURL.path)")
+                logger.debug("afinfo excerpt: \(afinfoExcerpt(output))")
+                return false
+            }
+
+            return true
         } catch {
             logger.debug("Failed to run afinfo for \(fileURL.path): \(error.localizedDescription)")
             return false
         }
     }
+
+    static func isValidFLACFileWithAudioData(at fileURL: URL, logger: Logger) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/afinfo")
+        process.arguments = [fileURL.path]
+
+        let pipe = Pipe()
+        process.standardError = pipe
+        process.standardOutput = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: outputData, encoding: .utf8) ?? ""
+
+            if process.terminationStatus != 0 {
+                logger.debug("afinfo reported non-FLAC or unreadable file: \(fileURL.path)")
+                logger.debug("afinfo excerpt: \(afinfoExcerpt(output))")
+                return false
+            }
+
+            guard isFLACMetadataOutput(output) else {
+                logger.debug("afinfo did not report FLAC format for \(fileURL.path)")
+                logger.debug("afinfo excerpt: \(afinfoExcerpt(output))")
+                return false
+            }
+
+            guard hasAudioDataMetadata(output) else {
+                logger.debug("afinfo did not report playable audio data for \(fileURL.path)")
+                logger.debug("afinfo excerpt: \(afinfoExcerpt(output))")
+                return false
+            }
+
+            return true
+        } catch {
+            logger.debug("Failed to run afinfo for \(fileURL.path): \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    static func detailedErrorMessage(_ error: Error?) -> String {
+        guard let error else {
+            return "No detailed error was provided by AVFoundation."
+        }
+
+        let nsError = error as NSError
+        let reason = nsError.localizedFailureReason ?? "No failure reason provided."
+        var message = "\(nsError.localizedDescription) (domain=\(nsError.domain), code=\(nsError.code), reason=\(reason))"
+
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            message += " underlying=(domain=\(underlying.domain), code=\(underlying.code)"
+            if underlying.domain == NSOSStatusErrorDomain,
+               let fourCC = osStatusFourCC(underlying.code) {
+                message += ", fourCC='\(fourCC)'"
+            }
+            message += ")"
+        }
+
+        return message
+    }
+
+    static func afinfoExcerpt(_ output: String, maxLines: Int = 8) -> String {
+        let lines = output
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+            .prefix(maxLines)
+        if lines.isEmpty {
+            return "<no afinfo output>"
+        }
+        return lines.joined(separator: " | ")
+    }
+
+    static func describeAudioTrack(_ track: AVAssetTrack) -> String {
+        for formatDescription in track.formatDescriptions {
+            let audioFormat = formatDescription as! CMAudioFormatDescription
+            guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?.pointee
+            else {
+                continue
+            }
+
+            return "sampleRate=\(streamDescription.mSampleRate), channels=\(streamDescription.mChannelsPerFrame), formatID=\(streamDescription.mFormatID)"
+        }
+
+        return "sampleRate=unknown, channels=unknown, formatID=unknown"
+    }
+
+    static func osStatusFourCC(_ code: Int) -> String? {
+        let ucode = UInt32(bitPattern: Int32(code))
+        var chars: [UnicodeScalar] = []
+        for shift in stride(from: 24, through: 0, by: -8) {
+            let value = UInt8((ucode >> UInt32(shift)) & 0xFF)
+            guard value >= 32 && value <= 126 else {
+                return nil
+            }
+            chars.append(UnicodeScalar(value))
+        }
+        return String(String.UnicodeScalarView(chars))
+    }
+
+    private static func checkOSStatus(_ status: OSStatus, context: String) throws {
+        guard status == noErr else {
+            var message = "\(context) failed with status \(status)"
+            if let fourCC = osStatusFourCC(Int(status)) {
+                message += " ('\(fourCC)')"
+            }
+            throw CLIError(message)
+        }
+    }
+
+    private static let flacWriteCallback: FLAC__StreamDecoderWriteCallback = {
+        decoder, framePointer, bufferPointer, clientData in
+        guard let framePointer, let bufferPointer, let clientData else {
+            return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT
+        }
+
+        let state = Unmanaged<FLACDecoderState>.fromOpaque(clientData).takeUnretainedValue()
+        let frame = framePointer.pointee
+        let channels = Int(frame.header.channels)
+        let blockSize = Int(frame.header.blocksize)
+
+        guard channels > 0, blockSize > 0 else {
+            return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT
+        }
+
+        let outputChannels = min(channels, Int(state.channels ?? UInt32(channels)))
+        if outputChannels <= 0 {
+            return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT
+        }
+
+        state.pcmData.reserveCapacity(state.pcmData.count + blockSize * outputChannels * MemoryLayout<Int16>.size)
+
+        for sampleIndex in 0 ..< blockSize {
+            for channel in 0 ..< outputChannels {
+                guard let channelPointer = bufferPointer[channel] else {
+                    return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT
+                }
+                let sample32 = channelPointer[sampleIndex]
+                let clipped = max(Int32(Int16.min), min(Int32(Int16.max), sample32))
+                var sample16 = Int16(clipped)
+                withUnsafeBytes(of: &sample16) { bytes in
+                    state.pcmData.append(contentsOf: bytes)
+                }
+            }
+        }
+
+        return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE
+    }
+
+    private static let flacMetadataCallback: FLAC__StreamDecoderMetadataCallback = {
+        decoder, metadataPointer, clientData in
+        guard let metadataPointer, let clientData else {
+            return
+        }
+
+        let state = Unmanaged<FLACDecoderState>.fromOpaque(clientData).takeUnretainedValue()
+        let metadata = metadataPointer.pointee
+        guard metadata.type == FLAC__METADATA_TYPE_STREAMINFO else {
+            return
+        }
+
+        let streamInfo = metadata.data.stream_info
+        state.sampleRate = streamInfo.sample_rate
+        state.channels = UInt32(min(max(Int(streamInfo.channels), 1), 2))
+    }
+
+    private static let flacErrorCallback: FLAC__StreamDecoderErrorCallback = {
+        decoder, status, clientData in
+        guard let clientData else {
+            return
+        }
+
+        let state = Unmanaged<FLACDecoderState>.fromOpaque(clientData).takeUnretainedValue()
+        state.decodeErrorMessages.append("FLAC decoder error status \(status.rawValue)")
+    }
+}
+
+private final class FLACDecoderState {
+    var sampleRate: UInt32?
+    var channels: UInt32?
+    var pcmData = Data()
+    var decodeErrorMessages: [String] = []
+}
+
+private struct DecodedPCM16 {
+    let sampleRate: Double
+    let channels: UInt32
+    let pcmData: Data
+    let totalFrames: Int
 }
 
 enum ParsedCommand {
@@ -754,6 +1355,20 @@ struct CLIError: Error, LocalizedError {
 
     var errorDescription: String? {
         message
+    }
+}
+
+enum AudioValidationError: Error, LocalizedError {
+    case invalidSourceFLAC(path: String)
+    case invalidConvertedM4A(path: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidSourceFLAC(let path):
+            return "Source FLAC file is invalid or has no audio data: \(path)"
+        case .invalidConvertedM4A(let path):
+            return "Converted file is not a valid AAC with audio data: \(path)"
+        }
     }
 }
 

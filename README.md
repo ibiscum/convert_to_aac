@@ -10,11 +10,13 @@ Recursive audio processor for macOS that scans a source directory, converts .mp3
 - Mirrors relative paths and filenames under <target_dir>/<source_dir_name>
 - Supports dry run mode to preview actions
 - Supports debug mode for verbose logging
+- Debug mode now includes FLAC/AAC `afinfo` excerpts and AVFoundation error domain/code details for failed conversions
 
 ## Requirements
 
-- macOS (uses /usr/bin/afconvert)
+- macOS (uses AVFoundation for AAC encoding)
 - Swift toolchain (Swift Package Manager)
+- libFLAC development library discoverable via `pkg-config` (e.g. Homebrew `flac`)
 
 ## Build
 
@@ -72,7 +74,7 @@ If called with invalid options or insufficient arguments, the program prints a s
 
 - Input extensions matched case-insensitively: .mp3, .flac, .aac, .m4a
 - Converted output extension: .m4a
-- Output codec settings: AAC-LC with high quality settings (afconvert -f m4af -d aac -ch 2 -b 256000 -s 2 -q 127)
+- Output codec settings: AAC-LC in .m4a with 256 kbps target bitrate (source sample rate preserved, channels capped to stereo)
 - .aac and .m4a source files are copied to target path without conversion
 - Metadata transfer runs only for converted .mp3 and .flac inputs (not for copied .aac/.m4a files)
 - Metadata tags are read with ffprobe and written to the output .m4a with AtomicParsley
@@ -80,6 +82,9 @@ If called with invalid options or insufficient arguments, the program prints a s
 - If ffprobe or AtomicParsley is missing, conversion still succeeds but metadata/artwork injection is skipped
 - If ffmpeg is missing, conversion and metadata tag transfer still succeed, but cover art transfer is skipped
 - If the expected target file already exists in the target folder and is a valid AAC file, processing is skipped
+- Before converting a `.flac` source file, it is validated with `afinfo` to confirm FLAC format and non-empty audio data; invalid FLAC input causes immediate program exit with error
+- `.flac` decoding uses `libFLAC` to PCM, then AAC `.m4a` encoding is done via CoreAudio (`ExtAudioFile`)
+- After each MP3/FLAC conversion, the generated `.m4a` is validated with `afinfo` to confirm AAC format and non-empty audio data; failed validation causes immediate program exit with error
 - Hidden files and directories are skipped during traversal
 - Source and target directory must be different
 
@@ -87,7 +92,7 @@ If called with invalid options or insufficient arguments, the program prints a s
 
 For each converted .mp3/.flac file, processing happens in this order:
 
-1. afconvert creates the AAC .m4a audio file.
+1. AVFoundation transcodes source audio to AAC `.m4a`.
 2. ffprobe reads source tags (JSON output).
 3. AtomicParsley writes supported tags into a temporary .m4a output file.
 4. ffmpeg attempts to extract the first embedded image stream as a temporary JPEG.
@@ -116,19 +121,18 @@ Notes:
 
 ## Conversion Quality
 
-The converter uses macOS `afconvert` with these audio settings for `.mp3` and `.flac` inputs:
+The converter uses AVFoundation (`AVAssetReader` + `AVAssetWriter`) with these audio settings for `.mp3` and `.flac` inputs:
 
-- Codec and container: AAC-LC in `.m4a` (`-f m4af -d aac`)
-- Channels: stereo output (`-ch 2`)
-- Target bitrate: `256 kbps` (`-b 256000`)
-- Encoder quality: highest quality value (`-q 127`)
-- Strategy: `-s 2` (high-quality AAC encoding strategy in `afconvert`)
+- Codec and container: AAC-LC in `.m4a`
+- Target bitrate: `256 kbps`
+- Sample rate: preserved from source track when available (fallback `44.1 kHz`)
+- Channels: source channel count, capped to stereo (1-2 channels)
 
 Why these settings were chosen:
 
 - Good quality-to-size balance: AAC-LC at 256 kbps is typically transparent for most music libraries while staying smaller than lossless sources.
 - Broad compatibility: AAC-LC in M4A is widely supported across Apple devices, players, and media servers.
-- Stable batch behavior: fixed high-quality settings reduce surprises across mixed source material during large recursive conversions.
+- Stable batch behavior: fixed high-bitrate AAC settings reduce surprises across mixed source material during large recursive conversions.
 
 Important quality notes:
 
