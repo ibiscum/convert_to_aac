@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "convert_to_aac",
     platforms: [
-        .macOS(.v10_15),
+        .macOS("27.0"),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.4"),

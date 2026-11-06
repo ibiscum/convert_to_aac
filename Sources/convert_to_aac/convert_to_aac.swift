@@ -1,5 +1,5 @@
 import Foundation
-import AVFoundation
+@preconcurrency import AVFoundation
 import AudioToolbox
 import CFLAC
 
@@ -8,29 +8,32 @@ struct ConvertToAAC {
     private static let convertibleExtensions: Set<String> = ["mp3", "flac"]
     private static let copyOnlyExtensions: Set<String> = ["aac", "m4a"]
 
-    static func main() {
+    static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
-        let logger = Logger(level: args.contains("-d") ? .debug : .info)
 
         do {
             switch try parseCommand(args) {
             case .help:
+                let logger = Logger(level: args.contains("-d") ? .debug : .info)
                 logger.info("\(usageText())")
                 Foundation.exit(EXIT_SUCCESS)
             case .run(let config):
-                try run(config: config, logger: logger)
+                let logger = Logger(level: config.debug ? .debug : .info)
+                try await run(config: config, logger: logger)
             }
         } catch let cliError as CLIError {
+            let logger = Logger(level: args.contains("-d") ? .debug : .info)
             logger.error("Error: \(cliError.message)")
             logger.info("\(shortUsageText())")
             Foundation.exit(EXIT_FAILURE)
         } catch {
+            let logger = Logger(level: args.contains("-d") ? .debug : .info)
             logger.error("Unexpected error: \(error.localizedDescription)")
             Foundation.exit(EXIT_FAILURE)
         }
     }
 
-    private static func run(config: Config, logger: Logger) throws {
+    private static func run(config: Config, logger: Logger) async throws {
         let fileManager = FileManager.default
         let sourceURL = URL(fileURLWithPath: config.sourceDirectory).standardizedFileURL
         let targetURL = URL(fileURLWithPath: config.targetDirectory).standardizedFileURL
@@ -82,7 +85,7 @@ struct ConvertToAAC {
         var convertedFiles = 0
         var failedFiles = 0
 
-        for case let fileURL as URL in enumerator {
+        while let fileURL = enumerator.nextObject() as? URL {
             let values = try fileURL.resourceValues(forKeys: resourceKeys)
             if values.isDirectory == true {
                 continue
@@ -135,7 +138,7 @@ struct ConvertToAAC {
             do {
                 switch action {
                 case .convertToM4A:
-                    try convertToAAC(
+                    try await convertToAAC(
                         source: fileURL,
                         target: outputURL,
                         explicitLRChannels: config.explicitLRChannels,
@@ -181,7 +184,7 @@ struct ConvertToAAC {
         ffprobeURL: URL?,
         atomicParsleyURL: URL?,
         logger: Logger
-    ) throws {
+    ) async throws {
         logger.debug("Starting conversion: \(source.path) -> \(target.path)")
 
         let sourceExt = source.pathExtension.lowercased()
@@ -200,7 +203,7 @@ struct ConvertToAAC {
                     logger: logger
                 )
             } else {
-                try convertToAACUsingAVFoundation(source: source, target: target, logger: logger)
+                try await convertToAACUsingAVFoundation(source: source, target: target, logger: logger)
             }
         } catch {
             logger.error("Audio conversion failed for \(source.path): \(error.localizedDescription)")
@@ -229,21 +232,22 @@ struct ConvertToAAC {
         }
 
         if sourceExt == "flac" {
-            logPostConversionLoudnessSanity(for: target, logger: logger)
+            await logPostConversionLoudnessSanity(for: target, logger: logger)
         }
     }
 
-    private static func convertToAACUsingAVFoundation(source: URL, target: URL, logger: Logger) throws {
+    private static func convertToAACUsingAVFoundation(source: URL, target: URL, logger: Logger) async throws {
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: target.path) {
             try fileManager.removeItem(at: target)
         }
 
         let asset = AVURLAsset(url: source)
-        guard let audioTrack = asset.tracks(withMediaType: .audio).first else {
+        let audioTracks = try await loadAudioTracks(from: asset)
+        guard let audioTrack = audioTracks.first else {
             throw CLIError("Source file has no audio track: \(source.path)")
         }
-        logger.debug("Source track details for \(source.lastPathComponent): \(describeAudioTrack(audioTrack))")
+        logger.debug("Source track details for \(source.lastPathComponent): \(try await describeAudioTrack(audioTrack))")
 
         let reader = try AVAssetReader(asset: asset)
         let readerOutput = AVAssetReaderTrackOutput(
@@ -256,76 +260,58 @@ struct ConvertToAAC {
                 AVLinearPCMIsNonInterleaved: false,
             ]
         )
-        guard reader.canAdd(readerOutput) else {
-            throw CLIError("AVFoundation reader could not attach audio output for \(source.path)")
-        }
-        reader.add(readerOutput)
+        let readerProvider = reader.outputProvider(for: readerOutput)
 
         let writer = try AVAssetWriter(outputURL: target, fileType: .m4a)
-        let audioSettings = avFoundationAACOutputSettings(for: audioTrack)
+        let audioSettings = try await avFoundationAACOutputSettings(for: audioTrack)
         let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        writerInput.expectsMediaDataInRealTime = false
+        let writerReceiver = writer.inputReceiver(for: writerInput)
 
-        guard writer.canAdd(writerInput) else {
-            throw CLIError("AVFoundation writer could not attach AAC input for \(target.path)")
+        do {
+            try writer.start()
+        } catch {
+            throw CLIError("AVFoundation failed to start writing \(target.path). \(detailedErrorMessage(error))")
         }
-        writer.add(writerInput)
-
-        guard writer.startWriting() else {
-            throw CLIError(
-                "AVFoundation failed to start writing \(target.path). \(detailedErrorMessage(writer.error))"
-            )
-        }
-        guard reader.startReading() else {
+        do {
+            try reader.start()
+        } catch {
             writer.cancelWriting()
-            throw CLIError(
-                "AVFoundation failed to start reading \(source.path). \(detailedErrorMessage(reader.error))"
-            )
+            throw CLIError("AVFoundation failed to start reading \(source.path). \(detailedErrorMessage(error))")
         }
 
         writer.startSession(atSourceTime: .zero)
         let conversionDeadline = Date().addingTimeInterval(300)
-        var reachedEndOfInput = false
 
-        while !reachedEndOfInput {
+        while true {
             if Date() > conversionDeadline {
                 reader.cancelReading()
                 writer.cancelWriting()
                 throw CLIError("Timed out after 300s running AVFoundation conversion for \(source.path)")
             }
 
-            if writerInput.isReadyForMoreMediaData {
-                if let sampleBuffer = readerOutput.copyNextSampleBuffer() {
-                    if !writerInput.append(sampleBuffer) {
-                        reader.cancelReading()
-                        writer.cancelWriting()
-                        throw CLIError(
-                            "AVFoundation append failed for \(source.path). \(detailedErrorMessage(writer.error))"
-                        )
-                    }
-                } else {
-                    writerInput.markAsFinished()
-                    reachedEndOfInput = true
-                }
-            } else {
-                if reader.status == .failed {
-                    writer.cancelWriting()
-                    throw CLIError(
-                        "AVFoundation read failed for \(source.path). \(detailedErrorMessage(reader.error))"
-                    )
-                }
-                Thread.sleep(forTimeInterval: 0.01)
+            let sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
+            do {
+                sampleBuffer = try await readerProvider.next()
+            } catch {
+                writer.cancelWriting()
+                throw CLIError("AVFoundation read failed for \(source.path). \(detailedErrorMessage(error))")
+            }
+
+            guard let sampleBuffer else {
+                break
+            }
+
+            do {
+                try await writerReceiver.append(sampleBuffer)
+            } catch {
+                reader.cancelReading()
+                writer.cancelWriting()
+                throw CLIError("AVFoundation append failed for \(source.path). \(detailedErrorMessage(error))")
             }
         }
 
-        let finishSemaphore = DispatchSemaphore(value: 0)
-        writer.finishWriting {
-            finishSemaphore.signal()
-        }
-        if finishSemaphore.wait(timeout: .now() + .seconds(300)) == .timedOut {
-            writer.cancelWriting()
-            throw CLIError("Timed out after 300s finalizing AVFoundation output for \(target.path)")
-        }
+        writerReceiver.finish()
+        await writer.finishWriting()
 
         if reader.status == .failed {
             throw CLIError("AVFoundation read failed for \(source.path). \(detailedErrorMessage(reader.error))")
@@ -562,12 +548,13 @@ struct ConvertToAAC {
         )
     }
 
-    private static func avFoundationAACOutputSettings(for track: AVAssetTrack) -> [String: Any] {
+    private static func avFoundationAACOutputSettings(for track: AVAssetTrack) async throws -> [String: Any] {
         var sampleRate: Double = 44_100
         var channels = 2
 
-        for formatDescription in track.formatDescriptions {
-            let audioFormat = formatDescription as! CMAudioFormatDescription
+        let formatDescriptions = try await loadFormatDescriptions(from: track)
+        for formatDescription in formatDescriptions {
+            let audioFormat = formatDescription
             guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?
                     .pointee else {
                 continue
@@ -915,6 +902,14 @@ struct ConvertToAAC {
         return ProcessResult(terminationStatus: process.terminationStatus, output: output)
     }
 
+    private static func loadAudioTracks(from asset: AVAsset) async throws -> [AVAssetTrack] {
+        try await asset.loadTracks(withMediaType: .audio)
+    }
+
+    private static func loadFormatDescriptions(from track: AVAssetTrack) async throws -> [CMAudioFormatDescription] {
+        try await track.load(.formatDescriptions)
+    }
+
     static func parseCommand(_ args: [String]) throws -> ParsedCommand {
         var debug = false
         var dryRun = false
@@ -967,7 +962,7 @@ struct ConvertToAAC {
           -d    Enable debug output
           -n    Dry run (show what would be converted)
           --explicit-lr  For multichannel FLAC, map only source channels 1/2 directly to L/R
-          -h    Show help
+          -h, --help    Show help
         """
     }
 
@@ -995,19 +990,50 @@ struct ConvertToAAC {
         }
 
         let relativePath = String(filePath.dropFirst(sourcePath.count + 1))
-        let outputRelative: String
+        let relativeComponents = relativePath.split(separator: "/").map(String.init)
+        guard let sourceFileName = relativeComponents.last else {
+            throw CLIError("Failed to derive source file name from path: \(filePath)")
+        }
+        let normalizedDirectories = try relativeComponents.dropLast().map {
+            try normalizedOutputPathComponentName($0, path: filePath)
+        }
+
+        let outputFileName: String
         switch action {
         case .convertToM4A:
-            let relativeWithoutExt = (relativePath as NSString).deletingPathExtension
-            outputRelative = relativeWithoutExt + ".m4a"
+            let sourceStem = (sourceFileName as NSString).deletingPathExtension
+            let normalizedStem = try normalizedOutputPathComponentName(sourceStem, path: filePath)
+            outputFileName = normalizedStem + ".m4a"
         case .copyAAC:
-            outputRelative = relativePath
+            outputFileName = try normalizedOutputPathComponentName(sourceFileName, path: filePath)
         }
-        let sourceRootName = sourceRoot.standardizedFileURL.lastPathComponent
-        return targetRoot
+
+        let normalizedSourceRootName = try normalizedOutputPathComponentName(
+            sourceRoot.standardizedFileURL.lastPathComponent,
+            path: sourcePath
+        )
+        var outputURL = targetRoot
             .standardizedFileURL
-            .appendingPathComponent(sourceRootName)
-            .appendingPathComponent(outputRelative)
+            .appendingPathComponent(normalizedSourceRootName)
+        for directory in normalizedDirectories {
+            outputURL.appendPathComponent(directory)
+        }
+
+        return outputURL.appendingPathComponent(outputFileName)
+    }
+
+    private static func normalizedOutputPathComponentName(_ name: String, path: String) throws -> String {
+        let collapsed = name
+            .split(whereSeparator: { scalar in
+                scalar.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+            })
+            .joined(separator: " ")
+
+        guard !collapsed.isEmpty else {
+            throw CLIError("Output path component resolves to empty after whitespace normalization: \(path)")
+        }
+
+        return collapsed
     }
 
     static func shouldSkipConversion(
@@ -1186,9 +1212,10 @@ struct ConvertToAAC {
         return lines.joined(separator: " | ")
     }
 
-    static func describeAudioTrack(_ track: AVAssetTrack) -> String {
-        for formatDescription in track.formatDescriptions {
-            let audioFormat = formatDescription as! CMAudioFormatDescription
+    static func describeAudioTrack(_ track: AVAssetTrack) async throws -> String {
+        let formatDescriptions = try await loadFormatDescriptions(from: track)
+        for formatDescription in formatDescriptions {
+            let audioFormat = formatDescription
             guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?.pointee
             else {
                 continue
@@ -1200,9 +1227,9 @@ struct ConvertToAAC {
         return "sampleRate=unknown, channels=unknown, formatID=unknown"
     }
 
-    private static func logPostConversionLoudnessSanity(for target: URL, logger: Logger) {
+    private static func logPostConversionLoudnessSanity(for target: URL, logger: Logger) async {
         do {
-            let metrics = try quickLoudnessMetrics(for: target)
+            let metrics = try await quickLoudnessMetrics(for: target)
             logger.debug(
                 "FLAC post-conversion loudness check for \(target.lastPathComponent): " +
                 "peak=\(String(format: "%.1f", metrics.peakDbFS)) dBFS, " +
@@ -1222,9 +1249,10 @@ struct ConvertToAAC {
         }
     }
 
-    private static func quickLoudnessMetrics(for fileURL: URL, sampleLimit: Int = 1_000_000) throws -> LoudnessMetrics {
+    private static func quickLoudnessMetrics(for fileURL: URL, sampleLimit: Int = 1_000_000) async throws -> LoudnessMetrics {
         let asset = AVURLAsset(url: fileURL)
-        guard let audioTrack = asset.tracks(withMediaType: .audio).first else {
+        let audioTracks = try await loadAudioTracks(from: asset)
+        guard let audioTrack = audioTracks.first else {
             throw CLIError("Loudness check failed: no audio track in \(fileURL.path)")
         }
 
@@ -1239,38 +1267,50 @@ struct ConvertToAAC {
                 AVLinearPCMIsNonInterleaved: false,
             ]
         )
-        guard reader.canAdd(output) else {
-            throw CLIError("Loudness check failed: AVAssetReader cannot add output for \(fileURL.path)")
-        }
-        reader.add(output)
-
-        guard reader.startReading() else {
-            throw CLIError("Loudness check failed: cannot start reading \(fileURL.path). \(detailedErrorMessage(reader.error))")
+        let provider = reader.outputProvider(for: output)
+        do {
+            try reader.start()
+        } catch {
+            throw CLIError("Loudness check failed: cannot start reading \(fileURL.path). \(detailedErrorMessage(error))")
         }
 
         var sampleCount = 0
         var peak: Double = 0
         var sumSquares: Double = 0
 
-        while sampleCount < sampleLimit, let sampleBuffer = output.copyNextSampleBuffer() {
-            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
-                continue
+        while sampleCount < sampleLimit, let sampleBuffer = try await provider.next() {
+            var bytes: Data?
+            try sampleBuffer.withUnsafeSampleBuffer { rawBuffer in
+                guard let blockBuffer = CMSampleBufferGetDataBuffer(rawBuffer) else {
+                    return
+                }
+
+                let length = CMBlockBufferGetDataLength(blockBuffer)
+                guard length >= MemoryLayout<Int16>.size else {
+                    return
+                }
+
+                var localBytes = Data(count: length)
+                try localBytes.withUnsafeMutableBytes { rawBytes in
+                    guard let dst = rawBytes.baseAddress else {
+                        throw CLIError("Loudness check failed: empty PCM buffer for \(fileURL.path)")
+                    }
+                    let status = CMBlockBufferCopyDataBytes(
+                        blockBuffer,
+                        atOffset: 0,
+                        dataLength: length,
+                        destination: dst
+                    )
+                    guard status == kCMBlockBufferNoErr else {
+                        throw CLIError("Loudness check failed: cannot read PCM bytes for \(fileURL.path), status \(status)")
+                    }
+                }
+
+                bytes = localBytes
             }
 
-            let length = CMBlockBufferGetDataLength(blockBuffer)
-            guard length >= MemoryLayout<Int16>.size else {
+            guard let bytes else {
                 continue
-            }
-
-            var bytes = Data(count: length)
-            try bytes.withUnsafeMutableBytes { rawBytes in
-                guard let dst = rawBytes.baseAddress else {
-                    throw CLIError("Loudness check failed: empty PCM buffer for \(fileURL.path)")
-                }
-                let status = CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: dst)
-                guard status == kCMBlockBufferNoErr else {
-                    throw CLIError("Loudness check failed: cannot read PCM bytes for \(fileURL.path), status \(status)")
-                }
             }
 
             bytes.withUnsafeBytes { rawBytes in

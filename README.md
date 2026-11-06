@@ -15,7 +15,7 @@ Recursive audio processor for macOS that scans a source directory, converts .mp3
 ## Requirements
 
 - macOS (uses AVFoundation for AAC encoding)
-- Swift toolchain (Swift Package Manager)
+- Swift 6.3+ toolchain (Swift Package Manager)
 - libFLAC development library discoverable via `pkg-config` (e.g. Homebrew `flac`)
 
 ## Build

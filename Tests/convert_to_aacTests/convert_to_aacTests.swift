@@ -89,6 +89,34 @@ import Foundation
         #expect(output.path == "/output/input/artist/album/track01.aac")
     }
 
+@Test func outputURLNormalizesSpacesInFolderAndFileNamesForConversion() throws {
+        let sourceRoot = URL(fileURLWithPath: "/input   root ")
+        let targetRoot = URL(fileURLWithPath: "/output")
+        let inputFile = URL(fileURLWithPath: "/input   root / artist   name / album   one /  track   01 .flac")
+
+        let output = try ConvertToAAC.outputURL(
+            for: inputFile,
+            sourceRoot: sourceRoot,
+            targetRoot: targetRoot,
+            action: .convertToM4A
+        )
+        #expect(output.path == "/output/input root/artist name/album one/track 01.m4a")
+    }
+
+@Test func outputURLNormalizesSpacesInFolderAndFileNamesForCopy() throws {
+        let sourceRoot = URL(fileURLWithPath: "/input   root ")
+        let targetRoot = URL(fileURLWithPath: "/output")
+        let inputFile = URL(fileURLWithPath: "/input   root / artist   name / album   one /  track   01 .aac")
+
+        let output = try ConvertToAAC.outputURL(
+            for: inputFile,
+            sourceRoot: sourceRoot,
+            targetRoot: targetRoot,
+            action: .copyAAC
+        )
+        #expect(output.path == "/output/input root/artist name/album one/track 01 .aac")
+    }
+
 @Test func outputURLRejectsFilesOutsideSourceRoot() {
         let sourceRoot = URL(fileURLWithPath: "/input")
         let targetRoot = URL(fileURLWithPath: "/output")
@@ -118,7 +146,7 @@ import Foundation
         #expect(usage.contains("-d    Enable debug output"))
         #expect(usage.contains("-n    Dry run (show what would be converted)"))
         #expect(usage.contains("--explicit-lr  For multichannel FLAC, map only source channels 1/2 directly to L/R"))
-        #expect(usage.contains("-h    Show help"))
+        #expect(usage.contains("-h, --help    Show help"))
     }
 
 @Test func shortUsageRegression() {
