@@ -59,13 +59,14 @@ The test suite includes:
 ## Usage
 
 ```bash
-convert_to_aac [-d] [-n] <source_dir> <target_dir>
+convert_to_aac [-d] [-n] [--explicit-lr] <source_dir> <target_dir>
 ```
 
 ### Options
 
 - -d: Enable debug output
 - -n: Dry run (print operations without converting files)
+- --explicit-lr: For multichannel FLAC, map only source channels 1/2 directly to output L/R
 - -h, --help: Show help text
 
 If called with invalid options or insufficient arguments, the program prints a short usage summary and suggests using -h.
@@ -84,7 +85,9 @@ If called with invalid options or insufficient arguments, the program prints a s
 - If the expected target file already exists in the target folder and is a valid AAC file, processing is skipped
 - Before converting a `.flac` source file, it is validated with `afinfo` to confirm FLAC format and non-empty audio data; invalid FLAC input causes immediate program exit with error
 - `.flac` decoding uses `libFLAC` stream info (`sample_rate`, `bits_per_sample`) before audio frame conversion; decoded samples are scaled to full-range 32-bit signed PCM for CoreAudio input and then encoded to AAC `.m4a`
+- FLAC decode/encode is streamed in blocks from `libFLAC` into CoreAudio (no full-track PCM buffer in memory)
 - For FLAC sources, the output AAC encode target uses the source sample rate (for example, 96 kHz FLAC is encoded as 96 kHz AAC when supported by CoreAudio)
+- For multichannel FLAC, default behavior downmixes to stereo; with `--explicit-lr`, output uses only source channels 1/2 as direct L/R mapping
 - AAC in `.m4a` does not preserve a fixed PCM bit depth value such as 24-bit; source bit depth is used during decode/input precision, while output is AAC-LC at the configured bitrate
 - After each MP3/FLAC conversion, the generated `.m4a` is validated with `afinfo` to confirm AAC format and non-empty audio data; failed validation causes immediate program exit with error
 - After each FLAC conversion, a quick post-conversion loudness sanity check runs on the generated AAC and logs peak/RMS levels in debug mode; suspiciously quiet outputs are flagged with a warning

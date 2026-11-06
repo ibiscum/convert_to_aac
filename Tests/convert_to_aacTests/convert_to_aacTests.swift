@@ -11,10 +11,24 @@ import Foundation
         case .run(let config):
             #expect(config.debug == true)
             #expect(config.dryRun == true)
+            #expect(config.explicitLRChannels == false)
             #expect(config.sourceDirectory == "/music/src")
             #expect(config.targetDirectory == "/music/out")
         }
     }
+
+@Test func parseCommandParsesExplicitLROption() throws {
+    let command = try ConvertToAAC.parseCommand(["--explicit-lr", "/music/src", "/music/out"])
+
+    switch command {
+    case .help:
+        Issue.record("Expected .run command")
+    case .run(let config):
+        #expect(config.explicitLRChannels == true)
+        #expect(config.sourceDirectory == "/music/src")
+        #expect(config.targetDirectory == "/music/out")
+    }
+}
 
 @Test func parseCommandReturnsHelpForHelpFlags() throws {
         let shortHelp = try ConvertToAAC.parseCommand(["-h"])
@@ -100,15 +114,16 @@ import Foundation
 
 @Test func usageTextRegression() {
         let usage = ConvertToAAC.usageText()
-        #expect(usage.contains("Usage: convert_to_aac [-d] [-n] <source_dir> <target_dir>"))
+        #expect(usage.contains("Usage: convert_to_aac [-d] [-n] [--explicit-lr] <source_dir> <target_dir>"))
         #expect(usage.contains("-d    Enable debug output"))
         #expect(usage.contains("-n    Dry run (show what would be converted)"))
+        #expect(usage.contains("--explicit-lr  For multichannel FLAC, map only source channels 1/2 directly to L/R"))
         #expect(usage.contains("-h    Show help"))
     }
 
 @Test func shortUsageRegression() {
         let shortUsage = ConvertToAAC.shortUsageText()
-        #expect(shortUsage == "Usage: convert_to_aac [-d] [-n] <source_dir> <target_dir>\nTry 'convert_to_aac -h' for more information.\n")
+        #expect(shortUsage == "Usage: convert_to_aac [-d] [-n] [--explicit-lr] <source_dir> <target_dir>\nTry 'convert_to_aac -h' for more information.\n")
     }
 
 @Test func shouldSkipConversionFalseWhenTargetDoesNotExist() {
@@ -264,7 +279,7 @@ import Foundation
 
         #expect(process.terminationStatus != 0)
         #expect(stderrText.contains("Error: Expected exactly 2 arguments: <source_dir> <target_dir>"))
-        #expect(stderrText.contains("Usage: convert_to_aac [-d] [-n] <source_dir> <target_dir>"))
+        #expect(stderrText.contains("Usage: convert_to_aac [-d] [-n] [--explicit-lr] <source_dir> <target_dir>"))
         #expect(stderrText.contains("Try 'convert_to_aac -h' for more information."))
     }
 
@@ -324,6 +339,19 @@ import Foundation
     )
 
     #expect(ConvertToAAC.isSuspiciouslyQuietLoudness(metrics: normal) == false)
+}
+
+@Test func normalizedFLACOutputChannelsRespectsExplicitLROption() {
+    #expect(ConvertToAAC.normalizedFLACOutputChannels(sourceChannels: 1, explicitLRChannels: false) == 1)
+    #expect(ConvertToAAC.normalizedFLACOutputChannels(sourceChannels: 6, explicitLRChannels: false) == 2)
+    #expect(ConvertToAAC.normalizedFLACOutputChannels(sourceChannels: 6, explicitLRChannels: true) == 2)
+}
+
+@Test func downmixFLACSamplesToStereoUsesExplicitLRWhenEnabled() {
+    let channels: [Int32] = [100, 200, 5_000, 7_000, 9_000, 11_000]
+    let explicit = ConvertToAAC.downmixFLACSamplesToStereo(normalizedSamples: channels, explicitLRChannels: true)
+    #expect(explicit.left == 100)
+    #expect(explicit.right == 200)
 }
 
 private func builtExecutableURL(named executableName: String) throws -> URL {
