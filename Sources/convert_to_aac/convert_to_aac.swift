@@ -220,6 +220,10 @@ struct ConvertToAAC {
         guard isValidAACFileWithAudioData(at: target, logger: logger) else {
             throw AudioValidationError.invalidConvertedM4A(path: target.path)
         }
+
+        if sourceExt == "flac" {
+            logPostConversionLoudnessSanity(for: target, logger: logger)
+        }
     }
 
     private static func convertToAACUsingAVFoundation(source: URL, target: URL, logger: Logger) throws {
@@ -328,15 +332,15 @@ struct ConvertToAAC {
     }
 
     private static func convertFLACToAACUsingLibFLAC(source: URL, target: URL, logger: Logger) throws {
-        let decoded = try decodeFLACToPCM16(source: source, logger: logger)
-        try encodePCM16ToM4AUsingCoreAudio(pcm: decoded, target: target)
+        let decoded = try decodeFLACToPCM(source: source, logger: logger)
+        try encodePCMToM4AUsingCoreAudio(pcm: decoded, target: target)
         logger.debug(
             "Running libFLAC decode + CoreAudio AAC encode (\(source.path) -> \(target.path)); " +
-            "sampleRate=\(decoded.sampleRate), channels=\(decoded.channels), frames=\(decoded.totalFrames)"
+            "sampleRate=\(decoded.sampleRate), sourceBitsPerSample=\(decoded.sourceBitsPerSample), channels=\(decoded.channels), frames=\(decoded.totalFrames)"
         )
     }
 
-    private static func decodeFLACToPCM16(source: URL, logger: Logger) throws -> DecodedPCM16 {
+    private static func decodeFLACToPCM(source: URL, logger: Logger) throws -> DecodedPCM {
         guard let decoder = FLAC__stream_decoder_new() else {
             throw CLIError("libFLAC failed to initialize decoder for \(source.path)")
         }
@@ -359,42 +363,53 @@ struct ConvertToAAC {
             throw CLIError("libFLAC failed to open \(source.path): init status \(initStatus.rawValue)")
         }
 
-        guard FLAC__stream_decoder_process_until_end_of_stream(decoder) != 0 else {
-            throw CLIError("libFLAC failed while decoding \(source.path)")
+        guard FLAC__stream_decoder_process_until_end_of_metadata(decoder) != 0 else {
+            throw CLIError("libFLAC failed while reading stream metadata for \(source.path)")
         }
 
         guard let sampleRate = state.sampleRate, sampleRate > 0 else {
             throw CLIError("libFLAC did not report sample rate for \(source.path)")
         }
+        guard let bitsPerSample = state.bitsPerSample, bitsPerSample > 0 else {
+            throw CLIError("libFLAC did not report bits per sample for \(source.path)")
+        }
+        guard bitsPerSample <= 32 else {
+            throw CLIError("Unsupported FLAC bit depth \(bitsPerSample) for \(source.path)")
+        }
         guard let channels = state.channels, channels > 0 else {
             throw CLIError("libFLAC did not report channel count for \(source.path)")
+        }
+
+        guard FLAC__stream_decoder_process_until_end_of_stream(decoder) != 0 else {
+            throw CLIError("libFLAC failed while decoding \(source.path)")
         }
 
         if !state.decodeErrorMessages.isEmpty {
             logger.warning("libFLAC decode warnings for \(source.path): \(state.decodeErrorMessages.joined(separator: ", "))")
         }
 
-        let bytesPerFrame = Int(channels) * MemoryLayout<Int16>.size
+        let bytesPerFrame = Int(channels) * MemoryLayout<Int32>.size
         let totalFrames = state.pcmData.count / bytesPerFrame
         guard totalFrames > 0 else {
             throw CLIError("libFLAC produced no PCM frames for \(source.path)")
         }
 
-        return DecodedPCM16(
+        return DecodedPCM(
             sampleRate: Double(sampleRate),
             channels: channels,
+            sourceBitsPerSample: bitsPerSample,
             pcmData: state.pcmData,
             totalFrames: totalFrames
         )
     }
 
-    private static func encodePCM16ToM4AUsingCoreAudio(pcm: DecodedPCM16, target: URL) throws {
+    private static func encodePCMToM4AUsingCoreAudio(pcm: DecodedPCM, target: URL) throws {
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: target.path) {
             try fileManager.removeItem(at: target)
         }
 
-        let bytesPerSample = UInt32(MemoryLayout<Int16>.size)
+        let bytesPerSample = UInt32(MemoryLayout<Int32>.size)
         let bytesPerFrame = pcm.channels * bytesPerSample
 
         var clientFormat = AudioStreamBasicDescription(
@@ -405,7 +420,7 @@ struct ConvertToAAC {
             mFramesPerPacket: 1,
             mBytesPerFrame: bytesPerFrame,
             mChannelsPerFrame: pcm.channels,
-            mBitsPerChannel: 16,
+            mBitsPerChannel: 32,
             mReserved: 0
         )
 
@@ -1185,6 +1200,113 @@ struct ConvertToAAC {
         return "sampleRate=unknown, channels=unknown, formatID=unknown"
     }
 
+    private static func logPostConversionLoudnessSanity(for target: URL, logger: Logger) {
+        do {
+            let metrics = try quickLoudnessMetrics(for: target)
+            logger.debug(
+                "FLAC post-conversion loudness check for \(target.lastPathComponent): " +
+                "peak=\(String(format: "%.1f", metrics.peakDbFS)) dBFS, " +
+                "rms=\(String(format: "%.1f", metrics.rmsDbFS)) dBFS, " +
+                "samples=\(metrics.sampleCount)"
+            )
+
+            if isSuspiciouslyQuietLoudness(metrics: metrics) {
+                logger.warning(
+                    "Post-conversion loudness looks unusually low for \(target.path) " +
+                    "(peak=\(String(format: "%.1f", metrics.peakDbFS)) dBFS, " +
+                    "rms=\(String(format: "%.1f", metrics.rmsDbFS)) dBFS)."
+                )
+            }
+        } catch {
+            logger.warning("Post-conversion loudness check failed for \(target.path): \(error.localizedDescription)")
+        }
+    }
+
+    private static func quickLoudnessMetrics(for fileURL: URL, sampleLimit: Int = 1_000_000) throws -> LoudnessMetrics {
+        let asset = AVURLAsset(url: fileURL)
+        guard let audioTrack = asset.tracks(withMediaType: .audio).first else {
+            throw CLIError("Loudness check failed: no audio track in \(fileURL.path)")
+        }
+
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(
+            track: audioTrack,
+            outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+            ]
+        )
+        guard reader.canAdd(output) else {
+            throw CLIError("Loudness check failed: AVAssetReader cannot add output for \(fileURL.path)")
+        }
+        reader.add(output)
+
+        guard reader.startReading() else {
+            throw CLIError("Loudness check failed: cannot start reading \(fileURL.path). \(detailedErrorMessage(reader.error))")
+        }
+
+        var sampleCount = 0
+        var peak: Double = 0
+        var sumSquares: Double = 0
+
+        while sampleCount < sampleLimit, let sampleBuffer = output.copyNextSampleBuffer() {
+            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+                continue
+            }
+
+            let length = CMBlockBufferGetDataLength(blockBuffer)
+            guard length >= MemoryLayout<Int16>.size else {
+                continue
+            }
+
+            var bytes = Data(count: length)
+            try bytes.withUnsafeMutableBytes { rawBytes in
+                guard let dst = rawBytes.baseAddress else {
+                    throw CLIError("Loudness check failed: empty PCM buffer for \(fileURL.path)")
+                }
+                let status = CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: dst)
+                guard status == kCMBlockBufferNoErr else {
+                    throw CLIError("Loudness check failed: cannot read PCM bytes for \(fileURL.path), status \(status)")
+                }
+            }
+
+            bytes.withUnsafeBytes { rawBytes in
+                let pcmSamples = rawBytes.bindMemory(to: Int16.self)
+                for sample in pcmSamples {
+                    if sampleCount >= sampleLimit {
+                        break
+                    }
+                    let normalized = Double(abs(Int(sample))) / 32768.0
+                    peak = max(peak, normalized)
+                    sumSquares += normalized * normalized
+                    sampleCount += 1
+                }
+            }
+        }
+
+        if reader.status == .failed {
+            throw CLIError("Loudness check failed while reading \(fileURL.path). \(detailedErrorMessage(reader.error))")
+        }
+        guard sampleCount > 0 else {
+            throw CLIError("Loudness check found no PCM samples in \(fileURL.path)")
+        }
+
+        let rms = sqrt(sumSquares / Double(sampleCount))
+        let peakDbFS = 20 * log10(max(peak, 1e-12))
+        let rmsDbFS = 20 * log10(max(rms, 1e-12))
+        return LoudnessMetrics(sampleCount: sampleCount, peakLinear: peak, rmsLinear: rms, peakDbFS: peakDbFS, rmsDbFS: rmsDbFS)
+    }
+
+    static func isSuspiciouslyQuietLoudness(metrics: LoudnessMetrics) -> Bool {
+        if metrics.peakLinear <= 0.0001 {
+            return true
+        }
+        return metrics.peakLinear <= 0.002 && metrics.rmsLinear <= 0.0003
+    }
+
     static func osStatusFourCC(_ code: Int) -> String? {
         let ucode = UInt32(bitPattern: Int32(code))
         var chars: [UnicodeScalar] = []
@@ -1228,17 +1350,16 @@ struct ConvertToAAC {
             return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT
         }
 
-        state.pcmData.reserveCapacity(state.pcmData.count + blockSize * outputChannels * MemoryLayout<Int16>.size)
+        state.pcmData.reserveCapacity(state.pcmData.count + blockSize * outputChannels * MemoryLayout<Int32>.size)
+        let bitsPerSample = Int(state.bitsPerSample ?? 32)
 
         for sampleIndex in 0 ..< blockSize {
             for channel in 0 ..< outputChannels {
                 guard let channelPointer = bufferPointer[channel] else {
                     return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT
                 }
-                let sample32 = channelPointer[sampleIndex]
-                let clipped = max(Int32(Int16.min), min(Int32(Int16.max), sample32))
-                var sample16 = Int16(clipped)
-                withUnsafeBytes(of: &sample16) { bytes in
+                var sample32 = normalizeFLACSampleToPCM32(channelPointer[sampleIndex], bitsPerSample: bitsPerSample)
+                withUnsafeBytes(of: &sample32) { bytes in
                     state.pcmData.append(contentsOf: bytes)
                 }
             }
@@ -1262,6 +1383,7 @@ struct ConvertToAAC {
         let streamInfo = metadata.data.stream_info
         state.sampleRate = streamInfo.sample_rate
         state.channels = UInt32(min(max(Int(streamInfo.channels), 1), 2))
+        state.bitsPerSample = streamInfo.bits_per_sample
     }
 
     private static let flacErrorCallback: FLAC__StreamDecoderErrorCallback = {
@@ -1273,20 +1395,47 @@ struct ConvertToAAC {
         let state = Unmanaged<FLACDecoderState>.fromOpaque(clientData).takeUnretainedValue()
         state.decodeErrorMessages.append("FLAC decoder error status \(status.rawValue)")
     }
+
+    static func normalizeFLACSampleToPCM32(_ sample: Int32, bitsPerSample: Int) -> Int32 {
+        guard bitsPerSample > 0 else {
+            return sample
+        }
+
+        if bitsPerSample < 32 {
+            return sample << (32 - bitsPerSample)
+        }
+
+        if bitsPerSample > 32 {
+            return sample >> (bitsPerSample - 32)
+        }
+
+        return sample
+    }
+
 }
 
 private final class FLACDecoderState {
     var sampleRate: UInt32?
     var channels: UInt32?
+    var bitsPerSample: UInt32?
     var pcmData = Data()
     var decodeErrorMessages: [String] = []
 }
 
-private struct DecodedPCM16 {
+private struct DecodedPCM {
     let sampleRate: Double
     let channels: UInt32
+    let sourceBitsPerSample: UInt32
     let pcmData: Data
     let totalFrames: Int
+}
+
+struct LoudnessMetrics {
+    let sampleCount: Int
+    let peakLinear: Double
+    let rmsLinear: Double
+    let peakDbFS: Double
+    let rmsDbFS: Double
 }
 
 enum ParsedCommand {

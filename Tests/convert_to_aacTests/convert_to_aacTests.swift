@@ -286,6 +286,46 @@ import Foundation
     #expect(invalidM4A.localizedDescription.contains("not a valid AAC with audio data"))
 }
 
+@Test func normalizeFLACSampleToPCM32Scales24BitToFullInt32Range() {
+    let positive24Bit = Int32(8_388_607)
+    let negative24Bit = Int32(-8_388_608)
+
+    #expect(ConvertToAAC.normalizeFLACSampleToPCM32(positive24Bit, bitsPerSample: 24) == 2_147_483_392)
+    #expect(ConvertToAAC.normalizeFLACSampleToPCM32(negative24Bit, bitsPerSample: 24) == Int32.min)
+}
+
+@Test func normalizeFLACSampleToPCM32Scales16BitToFullInt32Range() {
+    let positive16Bit = Int32(32_767)
+    let negative16Bit = Int32(-32_768)
+
+    #expect(ConvertToAAC.normalizeFLACSampleToPCM32(positive16Bit, bitsPerSample: 16) == 2_147_418_112)
+    #expect(ConvertToAAC.normalizeFLACSampleToPCM32(negative16Bit, bitsPerSample: 16) == Int32.min)
+}
+
+@Test func isSuspiciouslyQuietLoudnessDetectsNearSilence() {
+    let nearSilent = LoudnessMetrics(
+        sampleCount: 10_000,
+        peakLinear: 0.00005,
+        rmsLinear: 0.00001,
+        peakDbFS: -86.0,
+        rmsDbFS: -100.0
+    )
+
+    #expect(ConvertToAAC.isSuspiciouslyQuietLoudness(metrics: nearSilent) == true)
+}
+
+@Test func isSuspiciouslyQuietLoudnessAcceptsNormalProgramMaterial() {
+    let normal = LoudnessMetrics(
+        sampleCount: 10_000,
+        peakLinear: 0.65,
+        rmsLinear: 0.12,
+        peakDbFS: -3.7,
+        rmsDbFS: -18.4
+    )
+
+    #expect(ConvertToAAC.isSuspiciouslyQuietLoudness(metrics: normal) == false)
+}
+
 private func builtExecutableURL(named executableName: String) throws -> URL {
     let testBundleURL = URL(fileURLWithPath: #filePath)
     let testsDirectory = testBundleURL.deletingLastPathComponent()

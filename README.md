@@ -83,8 +83,11 @@ If called with invalid options or insufficient arguments, the program prints a s
 - If ffmpeg is missing, conversion and metadata tag transfer still succeed, but cover art transfer is skipped
 - If the expected target file already exists in the target folder and is a valid AAC file, processing is skipped
 - Before converting a `.flac` source file, it is validated with `afinfo` to confirm FLAC format and non-empty audio data; invalid FLAC input causes immediate program exit with error
-- `.flac` decoding uses `libFLAC` to PCM, then AAC `.m4a` encoding is done via CoreAudio (`ExtAudioFile`)
+- `.flac` decoding uses `libFLAC` stream info (`sample_rate`, `bits_per_sample`) before audio frame conversion; decoded samples are scaled to full-range 32-bit signed PCM for CoreAudio input and then encoded to AAC `.m4a`
+- For FLAC sources, the output AAC encode target uses the source sample rate (for example, 96 kHz FLAC is encoded as 96 kHz AAC when supported by CoreAudio)
+- AAC in `.m4a` does not preserve a fixed PCM bit depth value such as 24-bit; source bit depth is used during decode/input precision, while output is AAC-LC at the configured bitrate
 - After each MP3/FLAC conversion, the generated `.m4a` is validated with `afinfo` to confirm AAC format and non-empty audio data; failed validation causes immediate program exit with error
+- After each FLAC conversion, a quick post-conversion loudness sanity check runs on the generated AAC and logs peak/RMS levels in debug mode; suspiciously quiet outputs are flagged with a warning
 - Hidden files and directories are skipped during traversal
 - Source and target directory must be different
 
@@ -125,7 +128,7 @@ The converter uses AVFoundation (`AVAssetReader` + `AVAssetWriter`) with these a
 
 - Codec and container: AAC-LC in `.m4a`
 - Target bitrate: `256 kbps`
-- Sample rate: preserved from source track when available (fallback `44.1 kHz`)
+- Sample rate: preserved from source track/stream info when available (fallback `44.1 kHz` for AVFoundation path)
 - Channels: source channel count, capped to stereo (1-2 channels)
 
 Why these settings were chosen:
@@ -138,6 +141,7 @@ Important quality notes:
 
 - MP3 to AAC is a lossy-to-lossy transcode. If your source MP3 was already low bitrate, quality cannot be improved by conversion.
 - FLAC to AAC is lossy encoding from a lossless source; quality is high, but not lossless.
+- FLAC source resolution (for example 24-bit/96 kHz) is handled correctly for AAC conversion: sample rate is retained, and source precision is used during decode before AAC compression.
 - Existing `.aac` and `.m4a` files are copied without re-encoding to avoid generation loss.
 
 ## Examples
