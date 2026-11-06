@@ -93,6 +93,7 @@ If called with invalid options or insufficient arguments, the program prints a s
 - FLAC decode/encode is streamed in blocks from `libFLAC` into CoreAudio (no full-track PCM buffer in memory)
 - For FLAC sources, the output AAC encode target uses the source sample rate (for example, 96 kHz FLAC is encoded as 96 kHz AAC when supported by CoreAudio)
 - For multichannel FLAC, default behavior downmixes to stereo; with `--explicit-lr`, output uses only source channels 1/2 as direct L/R mapping
+- Multichannel stereo downmix applies fixed headroom and linear peak scaling (no compressor) before PCM32 conversion to avoid hard-clipping while preserving program dynamics
 - AAC in `.m4a` does not preserve a fixed PCM bit depth value such as 24-bit; source bit depth is used during decode/input precision, while output is AAC-LC at the configured bitrate
 - After each FLAC conversion, the generated `.m4a` is validated with `afinfo` to confirm AAC format and non-empty audio data; failed validation causes immediate program exit with error
 - After each FLAC conversion, a quick post-conversion loudness sanity check runs on the generated AAC and logs peak/RMS levels in debug mode; suspiciously quiet outputs are flagged with a warning

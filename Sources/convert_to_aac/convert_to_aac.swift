@@ -1283,6 +1283,7 @@ struct ConvertToAAC {
                 return false
             }
             let outputSamples = base.assumingMemoryBound(to: Int32.self)
+            let isDownmixingMultichannelToStereo = outputChannels == 2 && channels > 2 && !state.explicitLRChannels
 
             for sampleIndex in 0 ..< blockSize {
                 var normalizedSamples: [Int32] = []
@@ -1304,12 +1305,15 @@ struct ConvertToAAC {
                 if outputChannels == 1 {
                     outputSamples[frameStart] = normalizedSamples[0]
                 } else {
-                    let stereo = downmixFLACSamplesToStereo(
+                    let stereo = downmixFLACSamplesToStereoDouble(
                         normalizedSamples: normalizedSamples,
                         explicitLRChannels: state.explicitLRChannels
                     )
-                    outputSamples[frameStart] = stereo.left
-                    outputSamples[frameStart + 1] = stereo.right
+                    let normalizedStereo = isDownmixingMultichannelToStereo
+                        ? applyHeadroomAndLinearPeakScaling(stereoSample: stereo)
+                        : stereo
+                    outputSamples[frameStart] = clampDoubleToInt32(normalizedStereo.left)
+                    outputSamples[frameStart + 1] = clampDoubleToInt32(normalizedStereo.right)
                 }
             }
             return true
@@ -1402,11 +1406,23 @@ struct ConvertToAAC {
         normalizedSamples: [Int32],
         explicitLRChannels: Bool
     ) -> (left: Int32, right: Int32) {
+        let stereo = downmixFLACSamplesToStereoDouble(
+            normalizedSamples: normalizedSamples,
+            explicitLRChannels: explicitLRChannels
+        )
+        return (clampDoubleToInt32(stereo.left), clampDoubleToInt32(stereo.right))
+    }
+
+    static func downmixFLACSamplesToStereoDouble(
+        normalizedSamples: [Int32],
+        explicitLRChannels: Bool
+    ) -> (left: Double, right: Double) {
         if normalizedSamples.count == 1 {
-            return (normalizedSamples[0], normalizedSamples[0])
+            let mono = Double(normalizedSamples[0])
+            return (mono, mono)
         }
         if explicitLRChannels || normalizedSamples.count == 2 {
-            return (normalizedSamples[0], normalizedSamples[1])
+            return (Double(normalizedSamples[0]), Double(normalizedSamples[1]))
         }
 
         var left = Double(normalizedSamples[0])
@@ -1438,7 +1454,22 @@ struct ConvertToAAC {
             }
         }
 
-        return (clampDoubleToInt32(left), clampDoubleToInt32(right))
+        return (left, right)
+    }
+
+    static func applyHeadroomAndLinearPeakScaling(stereoSample: (left: Double, right: Double)) -> (left: Double, right: Double) {
+        var left = stereoSample.left * downmixHeadroomGain
+        var right = stereoSample.right * downmixHeadroomGain
+
+        let peakMagnitude = max(abs(left), abs(right))
+        let fullScale = Double(Int32.max)
+        if peakMagnitude > fullScale {
+            let scale = fullScale / peakMagnitude
+            left *= scale
+            right *= scale
+        }
+
+        return (left, right)
     }
 
     private static func clampDoubleToInt32(_ value: Double) -> Int32 {
@@ -1450,6 +1481,8 @@ struct ConvertToAAC {
         }
         return Int32(value.rounded(.towardZero))
     }
+
+    private static let downmixHeadroomGain: Double = 0.8912509381337456 // -1 dB
 
 }
 

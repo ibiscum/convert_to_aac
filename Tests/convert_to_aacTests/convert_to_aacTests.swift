@@ -416,6 +416,25 @@ import Foundation
     #expect(explicit.right == 200)
 }
 
+@Test func applyHeadroomAndLinearPeakScalingKeepsSafeValuesWithinRange() {
+    let sample = (left: 100_000.0, right: -100_000.0)
+    let normalized = ConvertToAAC.applyHeadroomAndLinearPeakScaling(stereoSample: sample)
+
+    #expect(abs(normalized.left) < abs(sample.left))
+    #expect(abs(normalized.right) < abs(sample.right))
+}
+
+@Test func applyHeadroomAndLinearPeakScalingPreventsOverflowByLinearScaling() {
+    let fullScale = Double(Int32.max)
+    let sample = (left: fullScale * 4.0, right: fullScale * 2.0)
+    let normalized = ConvertToAAC.applyHeadroomAndLinearPeakScaling(stereoSample: sample)
+    let ratioDelta = abs((normalized.left / normalized.right) - (sample.left / sample.right))
+
+    #expect(abs(normalized.left) <= fullScale)
+    #expect(abs(normalized.right) <= fullScale)
+    #expect(ratioDelta < 1e-12)
+}
+
 private func builtExecutableURL(named executableName: String) throws -> URL {
     let testBundleURL = URL(fileURLWithPath: #filePath)
     let testsDirectory = testBundleURL.deletingLastPathComponent()
