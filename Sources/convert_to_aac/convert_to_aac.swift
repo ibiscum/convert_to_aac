@@ -5,7 +5,7 @@ import CFLAC
 
 @main
 struct ConvertToAAC {
-    private static let convertibleExtensions: Set<String> = ["mp3", "flac"]
+    private static let convertibleExtensions: Set<String> = ["flac"]
     private static let copyOnlyExtensions: Set<String> = ["aac", "m4a"]
 
     static func main() async {
@@ -43,9 +43,7 @@ struct ConvertToAAC {
             throw CLIError("Source directory does not exist or is not a directory: \(sourceURL.path)")
         }
 
-        if sourceURL.path == targetURL.path {
-            throw CLIError("Source and target directory must be different")
-        }
+        try validateSourceAndTargetDirectories(sourceURL: sourceURL, targetURL: targetURL)
 
         let ffmpegURL = findExecutable(named: "ffmpeg")
         let ffprobeURL = findExecutable(named: "ffprobe")
@@ -58,7 +56,7 @@ struct ConvertToAAC {
             logger.warning("AtomicParsley not found; metadata injection will be skipped")
         }
         if ffmpegURL == nil {
-            logger.warning("ffmpeg not found; MP3/FLAC cover art transfer will be skipped")
+            logger.warning("ffmpeg not found; FLAC cover art transfer will be skipped")
         }
 
         if !config.dryRun {
@@ -123,7 +121,7 @@ struct ConvertToAAC {
             if config.dryRun {
                 switch action {
                 case .convertToM4A:
-                    logger.info("[dry-run] avfoundation-encode '\(fileURL.path)' -> '\(outputURL.path)'")
+                    logger.info("[dry-run] flac-coreaudio-encode '\(fileURL.path)' -> '\(outputURL.path)'")
                 case .copyAAC:
                     logger.info("[dry-run] copy '\(fileURL.path)' -> '\(outputURL.path)'")
                 }
@@ -165,7 +163,7 @@ struct ConvertToAAC {
         }
 
         logger.info("Scanned files: \(scannedFiles)")
-        logger.info("Matched files (.mp3/.flac/.aac/.m4a): \(matchedFiles)")
+        logger.info("Matched files (.flac/.aac/.m4a): \(matchedFiles)")
         logger.info("Skipped existing valid AAC files: \(skippedFiles)")
         if config.dryRun {
             logger.info("Dry run complete; no files converted")
@@ -188,29 +186,26 @@ struct ConvertToAAC {
         logger.debug("Starting conversion: \(source.path) -> \(target.path)")
 
         let sourceExt = source.pathExtension.lowercased()
-        if sourceExt == "flac" {
-            guard isValidFLACFileWithAudioData(at: source, logger: logger) else {
-                throw AudioValidationError.invalidSourceFLAC(path: source.path)
-            }
+        guard sourceExt == "flac" else {
+            throw CLIError("Unsupported convertible source extension: .\(sourceExt)")
+        }
+        guard isValidFLACFileWithAudioData(at: source, logger: logger) else {
+            throw AudioValidationError.invalidSourceFLAC(path: source.path)
         }
 
         do {
-            if sourceExt == "flac" {
-                try convertFLACToAACUsingLibFLAC(
-                    source: source,
-                    target: target,
-                    explicitLRChannels: explicitLRChannels,
-                    logger: logger
-                )
-            } else {
-                try await convertToAACUsingAVFoundation(source: source, target: target, logger: logger)
-            }
+            try convertFLACToAACUsingLibFLAC(
+                source: source,
+                target: target,
+                explicitLRChannels: explicitLRChannels,
+                logger: logger
+            )
         } catch {
             logger.error("Audio conversion failed for \(source.path): \(error.localizedDescription)")
             throw error
         }
 
-        // Transfer metadata using AtomicParsley. For MP3/FLAC, try to extract and inject artwork too.
+        // Transfer metadata using AtomicParsley. For FLAC, try to extract and inject artwork too.
         if let ffprobeURL = ffprobeURL, let atomicParsleyURL = atomicParsleyURL {
             logger.debug("Audio conversion finished for \(source.path); starting metadata transfer")
             do {
@@ -231,97 +226,7 @@ struct ConvertToAAC {
             throw AudioValidationError.invalidConvertedM4A(path: target.path)
         }
 
-        if sourceExt == "flac" {
-            await logPostConversionLoudnessSanity(for: target, logger: logger)
-        }
-    }
-
-    private static func convertToAACUsingAVFoundation(source: URL, target: URL, logger: Logger) async throws {
-        let fileManager = FileManager.default
-        if fileManager.fileExists(atPath: target.path) {
-            try fileManager.removeItem(at: target)
-        }
-
-        let asset = AVURLAsset(url: source)
-        let audioTracks = try await loadAudioTracks(from: asset)
-        guard let audioTrack = audioTracks.first else {
-            throw CLIError("Source file has no audio track: \(source.path)")
-        }
-        logger.debug("Source track details for \(source.lastPathComponent): \(try await describeAudioTrack(audioTrack))")
-
-        let reader = try AVAssetReader(asset: asset)
-        let readerOutput = AVAssetReaderTrackOutput(
-            track: audioTrack,
-            outputSettings: [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsNonInterleaved: false,
-            ]
-        )
-        let readerProvider = reader.outputProvider(for: readerOutput)
-
-        let writer = try AVAssetWriter(outputURL: target, fileType: .m4a)
-        let audioSettings = try await avFoundationAACOutputSettings(for: audioTrack)
-        let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        let writerReceiver = writer.inputReceiver(for: writerInput)
-
-        do {
-            try writer.start()
-        } catch {
-            throw CLIError("AVFoundation failed to start writing \(target.path). \(detailedErrorMessage(error))")
-        }
-        do {
-            try reader.start()
-        } catch {
-            writer.cancelWriting()
-            throw CLIError("AVFoundation failed to start reading \(source.path). \(detailedErrorMessage(error))")
-        }
-
-        writer.startSession(atSourceTime: .zero)
-        let conversionDeadline = Date().addingTimeInterval(300)
-
-        while true {
-            if Date() > conversionDeadline {
-                reader.cancelReading()
-                writer.cancelWriting()
-                throw CLIError("Timed out after 300s running AVFoundation conversion for \(source.path)")
-            }
-
-            let sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
-            do {
-                sampleBuffer = try await readerProvider.next()
-            } catch {
-                writer.cancelWriting()
-                throw CLIError("AVFoundation read failed for \(source.path). \(detailedErrorMessage(error))")
-            }
-
-            guard let sampleBuffer else {
-                break
-            }
-
-            do {
-                try await writerReceiver.append(sampleBuffer)
-            } catch {
-                reader.cancelReading()
-                writer.cancelWriting()
-                throw CLIError("AVFoundation append failed for \(source.path). \(detailedErrorMessage(error))")
-            }
-        }
-
-        writerReceiver.finish()
-        await writer.finishWriting()
-
-        if reader.status == .failed {
-            throw CLIError("AVFoundation read failed for \(source.path). \(detailedErrorMessage(reader.error))")
-        }
-
-        guard writer.status == .completed else {
-            throw CLIError("AVFoundation write failed for \(target.path). \(detailedErrorMessage(writer.error))")
-        }
-
-        logger.debug("Running AVFoundation AAC encode (\(source.path) -> \(target.path)) with settings: \(audioSettings)")
+        await logPostConversionLoudnessSanity(for: target, logger: logger)
     }
 
     private static func convertFLACToAACUsingLibFLAC(
@@ -548,37 +453,6 @@ struct ConvertToAAC {
         )
     }
 
-    private static func avFoundationAACOutputSettings(for track: AVAssetTrack) async throws -> [String: Any] {
-        var sampleRate: Double = 44_100
-        var channels = 2
-
-        let formatDescriptions = try await loadFormatDescriptions(from: track)
-        for formatDescription in formatDescriptions {
-            let audioFormat = formatDescription
-            guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?
-                    .pointee else {
-                continue
-            }
-
-            if streamDescription.mSampleRate > 0 {
-                sampleRate = streamDescription.mSampleRate
-            }
-            if streamDescription.mChannelsPerFrame > 0 {
-                channels = Int(streamDescription.mChannelsPerFrame)
-            }
-            break
-        }
-
-        let normalizedChannels = min(max(channels, 1), 2)
-
-        return [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVEncoderBitRateKey: 256_000,
-            AVSampleRateKey: sampleRate,
-            AVNumberOfChannelsKey: normalizedChannels,
-        ]
-    }
-
     static func findExecutable(named name: String) -> URL? {
         let searchPaths = [
             "/opt/homebrew/bin",
@@ -626,7 +500,7 @@ struct ConvertToAAC {
         logger: Logger
     ) throws {
         let sourceExt = source.pathExtension.lowercased()
-        guard sourceExt == "mp3" || sourceExt == "flac" else {
+        guard sourceExt == "flac" else {
             return
         }
 
@@ -640,7 +514,7 @@ struct ConvertToAAC {
         let temporaryTaggedOutputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("convert_to_aac_tagged_\(UUID().uuidString)")
             .appendingPathExtension("m4a")
-        if (sourceExt == "mp3" || sourceExt == "flac"), let ffmpegURL = ffmpegURL {
+        if let ffmpegURL = ffmpegURL {
             logger.debug("Metadata step: extracting artwork from \(source.path)")
             do {
                 temporaryArtworkURL = try extractArtworkFromSource(source: source, ffmpegURL: ffmpegURL)
@@ -906,10 +780,6 @@ struct ConvertToAAC {
         try await asset.loadTracks(withMediaType: .audio)
     }
 
-    private static func loadFormatDescriptions(from track: AVAssetTrack) async throws -> [CMAudioFormatDescription] {
-        try await track.load(.formatDescriptions)
-    }
-
     static func parseCommand(_ args: [String]) throws -> ParsedCommand {
         var debug = false
         var dryRun = false
@@ -953,8 +823,8 @@ struct ConvertToAAC {
         """
         Usage: convert_to_aac [-d] [-n] [--explicit-lr] <source_dir> <target_dir>
 
-        Recursively scans <source_dir> for .mp3, .flac, .aac, and .m4a files.
-        .mp3/.flac are converted to AAC (.m4a); .aac/.m4a are copied as-is.
+        Recursively scans <source_dir> for .flac, .aac, and .m4a files.
+        .flac is converted to AAC (.m4a); .aac/.m4a are copied as-is.
         Metadata tags are transferred via ffprobe + AtomicParsley; artwork extraction uses ffmpeg.
         The directory structure is mirrored under <target_dir>/<source_dir_name>.
 
@@ -968,6 +838,30 @@ struct ConvertToAAC {
 
     static func shortUsageText() -> String {
         "Usage: convert_to_aac [-d] [-n] [--explicit-lr] <source_dir> <target_dir>\nTry 'convert_to_aac -h' for more information.\n"
+    }
+
+    static func validateSourceAndTargetDirectories(sourceURL: URL, targetURL: URL) throws {
+        let normalizedSourceURL = sourceURL.resolvingSymlinksInPath().standardizedFileURL
+        let normalizedTargetURL = targetURL.resolvingSymlinksInPath().standardizedFileURL
+
+        let sourcePath = normalizedSourceURL.path
+        let targetPath = normalizedTargetURL.path
+
+        if sourcePath == targetPath {
+            throw CLIError("Source and target directory must be different")
+        }
+
+        if isDirectoryOrDescendant(normalizedSourceURL, of: normalizedTargetURL) ||
+            isDirectoryOrDescendant(normalizedTargetURL, of: normalizedSourceURL)
+        {
+            throw CLIError("Source and target directories must not contain each other")
+        }
+    }
+
+    private static func isDirectoryOrDescendant(_ candidate: URL, of parent: URL) -> Bool {
+        let parentPath = parent.path
+        let candidatePath = candidate.path
+        return candidatePath.hasPrefix(parentPath + "/")
     }
 
     static func sourceAction(forExtension ext: String) -> SourceAction? {
@@ -1210,21 +1104,6 @@ struct ConvertToAAC {
             return "<no afinfo output>"
         }
         return lines.joined(separator: " | ")
-    }
-
-    static func describeAudioTrack(_ track: AVAssetTrack) async throws -> String {
-        let formatDescriptions = try await loadFormatDescriptions(from: track)
-        for formatDescription in formatDescriptions {
-            let audioFormat = formatDescription
-            guard let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?.pointee
-            else {
-                continue
-            }
-
-            return "sampleRate=\(streamDescription.mSampleRate), channels=\(streamDescription.mChannelsPerFrame), formatID=\(streamDescription.mFormatID)"
-        }
-
-        return "sampleRate=unknown, channels=unknown, formatID=unknown"
     }
 
     private static func logPostConversionLoudnessSanity(for target: URL, logger: Logger) async {

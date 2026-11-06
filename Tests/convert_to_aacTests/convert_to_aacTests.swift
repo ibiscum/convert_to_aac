@@ -61,6 +61,40 @@ import Foundation
         }
     }
 
+@Test func validateSourceAndTargetDirectoriesRejectsSameDirectory() {
+    let source = URL(fileURLWithPath: "/music/library")
+    let target = URL(fileURLWithPath: "/music/library")
+
+    #expect(throws: CLIError.self) {
+        try ConvertToAAC.validateSourceAndTargetDirectories(sourceURL: source, targetURL: target)
+    }
+}
+
+@Test func validateSourceAndTargetDirectoriesRejectsTargetInsideSource() {
+    let source = URL(fileURLWithPath: "/music/library")
+    let target = URL(fileURLWithPath: "/music/library/aac")
+
+    #expect(throws: CLIError.self) {
+        try ConvertToAAC.validateSourceAndTargetDirectories(sourceURL: source, targetURL: target)
+    }
+}
+
+@Test func validateSourceAndTargetDirectoriesRejectsSourceInsideTarget() {
+    let source = URL(fileURLWithPath: "/music/library/source")
+    let target = URL(fileURLWithPath: "/music/library")
+
+    #expect(throws: CLIError.self) {
+        try ConvertToAAC.validateSourceAndTargetDirectories(sourceURL: source, targetURL: target)
+    }
+}
+
+@Test func validateSourceAndTargetDirectoriesAcceptsDisjointDirectories() throws {
+    let source = URL(fileURLWithPath: "/music/source")
+    let target = URL(fileURLWithPath: "/music/output")
+
+    try ConvertToAAC.validateSourceAndTargetDirectories(sourceURL: source, targetURL: target)
+}
+
 @Test func outputURLMirrorsStructureAndChangesExtension() throws {
         let sourceRoot = URL(fileURLWithPath: "/input")
         let targetRoot = URL(fileURLWithPath: "/output")
@@ -120,7 +154,7 @@ import Foundation
 @Test func outputURLRejectsFilesOutsideSourceRoot() {
         let sourceRoot = URL(fileURLWithPath: "/input")
         let targetRoot = URL(fileURLWithPath: "/output")
-        let inputFile = URL(fileURLWithPath: "/elsewhere/track.mp3")
+        let inputFile = URL(fileURLWithPath: "/elsewhere/track.flac")
 
         #expect(throws: CLIError.self) {
             _ = try ConvertToAAC.outputURL(
@@ -133,8 +167,8 @@ import Foundation
     }
 
 @Test func sourceActionClassifiesExtensions() {
-        #expect(ConvertToAAC.sourceAction(forExtension: "mp3") == .convertToM4A)
         #expect(ConvertToAAC.sourceAction(forExtension: "FLAC") == .convertToM4A)
+        #expect(ConvertToAAC.sourceAction(forExtension: "mp3") == nil)
         #expect(ConvertToAAC.sourceAction(forExtension: "aac") == .copyAAC)
         #expect(ConvertToAAC.sourceAction(forExtension: "M4A") == .copyAAC)
         #expect(ConvertToAAC.sourceAction(forExtension: "wav") == nil)
