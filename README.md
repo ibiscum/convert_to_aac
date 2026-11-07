@@ -80,7 +80,7 @@ If called with invalid options or insufficient arguments, the program prints a s
 
 - Input extensions matched case-insensitively: .flac, .aac, .m4a
 - Converted output extension: .m4a
-- Output codec settings: AAC-LC in .m4a with 256 kbps target bitrate (source sample rate preserved, channels capped to stereo)
+- Output codec settings: AAC-LC in .m4a with 256 kbps target bitrate (tries source sample rate first; falls back to 48 kHz, then 44.1 kHz if required by CoreAudio; channels capped to stereo)
 - .aac and .m4a source files are copied to target path without conversion
 - Metadata transfer runs only for converted .flac inputs (not for copied .aac/.m4a files)
 - Metadata tags are read with ffprobe and written to the output .m4a with AtomicParsley
@@ -90,8 +90,9 @@ If called with invalid options or insufficient arguments, the program prints a s
 - If the expected target file already exists in the target folder and is a valid AAC file, processing is skipped
 - Before converting a `.flac` source file, it is validated with `afinfo` to confirm FLAC format and non-empty audio data; invalid FLAC input causes immediate program exit with error
 - `.flac` decoding uses `libFLAC` stream info (`sample_rate`, `bits_per_sample`) before audio frame conversion; decoded samples are scaled to full-range 32-bit signed PCM for CoreAudio input and then encoded to AAC `.m4a`
+- CoreAudio AAC encoding first requests 32-bit integer PCM client input; if unsupported for a source/format combination, it automatically falls back to 32-bit float PCM client input
 - FLAC decode/encode is streamed in blocks from `libFLAC` into CoreAudio (no full-track PCM buffer in memory)
-- For FLAC sources, the output AAC encode target uses the source sample rate (for example, 96 kHz FLAC is encoded as 96 kHz AAC when supported by CoreAudio)
+- For FLAC sources, the output AAC encode target tries the source sample rate first (for example, 96 kHz), then automatically falls back to 48 kHz and 44.1 kHz if the source rate is rejected by CoreAudio
 - For multichannel FLAC, default behavior downmixes to stereo; with `--explicit-lr`, output uses only source channels 1/2 as direct L/R mapping
 - Multichannel stereo downmix applies fixed headroom and linear peak scaling (no compressor) before PCM32 conversion to avoid hard-clipping while preserving program dynamics
 - AAC in `.m4a` does not preserve a fixed PCM bit depth value such as 24-bit; source bit depth is used during decode/input precision, while output is AAC-LC at the configured bitrate
@@ -137,7 +138,7 @@ The converter uses libFLAC + CoreAudio with these audio settings for `.flac` inp
 
 - Codec and container: AAC-LC in `.m4a`
 - Target bitrate: `256 kbps`
-- Sample rate: preserved from FLAC stream info
+- Sample rate: source rate preferred; automatic fallback to 48 kHz or 44.1 kHz when required by CoreAudio
 - Channels: source channel count, capped to stereo (1-2 channels)
 
 Why these settings were chosen:
@@ -149,7 +150,7 @@ Why these settings were chosen:
 Important quality notes:
 
 - FLAC to AAC is lossy encoding from a lossless source; quality is high, but not lossless.
-- FLAC source resolution (for example 24-bit/96 kHz) is handled correctly for AAC conversion: sample rate is retained, and source precision is used during decode before AAC compression.
+- FLAC source resolution (for example 24-bit/96 kHz) is handled correctly for AAC conversion: source precision is used during decode before AAC compression, and sample rate is preserved when supported by CoreAudio (with automatic fallback otherwise).
 - Existing `.aac` and `.m4a` files are copied without re-encoding to avoid generation loss.
 
 ## Examples

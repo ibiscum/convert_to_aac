@@ -435,6 +435,25 @@ import Foundation
     #expect(ratioDelta < 1e-12)
 }
 
+@Test func pcm32DoubleToFloat32MapsIntRangeToUnitRange() {
+    #expect(ConvertToAAC.pcm32DoubleToFloat32(Double(Int32.min)) == -1.0)
+    #expect(ConvertToAAC.pcm32DoubleToFloat32(Double(Int32.max)) <= 1.0)
+    #expect(ConvertToAAC.pcm32DoubleToFloat32(0.0) == 0.0)
+}
+
+@Test func aacEncodeSampleRateCandidatesPrefersSourceThenFallbacks() {
+    let for96k = ConvertToAAC.aacEncodeSampleRateCandidates(sourceSampleRate: 96_000.0)
+    #expect(for96k.count == 3)
+    #expect(for96k[0] == 96_000.0)
+    #expect(for96k[1] == 48_000.0)
+    #expect(for96k[2] == 44_100.0)
+
+    let for48k = ConvertToAAC.aacEncodeSampleRateCandidates(sourceSampleRate: 48_000.0)
+    #expect(for48k.count == 2)
+    #expect(for48k[0] == 48_000.0)
+    #expect(for48k[1] == 44_100.0)
+}
+
 private func builtExecutableURL(named executableName: String) throws -> URL {
     let testBundleURL = URL(fileURLWithPath: #filePath)
     let testsDirectory = testBundleURL.deletingLastPathComponent()

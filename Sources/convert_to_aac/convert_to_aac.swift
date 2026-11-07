@@ -289,7 +289,8 @@ struct ConvertToAAC {
         state.encoder = try createCoreAudioAACEncoder(
             target: target,
             sampleRate: Double(sampleRate),
-            channels: outputChannels
+            channels: outputChannels,
+            logger: logger
         )
 
         guard FLAC__stream_decoder_process_until_end_of_stream(decoder) != 0 else {
@@ -321,25 +322,50 @@ struct ConvertToAAC {
     private static func createCoreAudioAACEncoder(
         target: URL,
         sampleRate: Double,
-        channels: UInt32
+        channels: UInt32,
+        logger: Logger
     ) throws -> FLACEncoderSession {
-        let bytesPerSample = UInt32(MemoryLayout<Int32>.size)
-        let bytesPerFrame = channels * bytesPerSample
+        let outputSampleRateCandidates = aacEncodeSampleRateCandidates(sourceSampleRate: sampleRate)
+        var attemptErrors: [String] = []
 
-        var clientFormat = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: bytesPerFrame,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: bytesPerFrame,
-            mChannelsPerFrame: channels,
-            mBitsPerChannel: 32,
-            mReserved: 0
+        for outputSampleRate in outputSampleRateCandidates {
+            do {
+                let session = try createCoreAudioAACEncoderSession(
+                    target: target,
+                    sourceSampleRate: sampleRate,
+                    outputSampleRate: outputSampleRate,
+                    channels: channels,
+                    logger: logger
+                )
+                if outputSampleRate != sampleRate {
+                    logger.warning(
+                        "CoreAudio AAC output sample rate fallback for \(target.path): " +
+                        "source \(Int(sampleRate)) Hz -> output \(Int(outputSampleRate)) Hz"
+                    )
+                }
+                return session
+            } catch let error as CLIError {
+                attemptErrors.append("\(Int(outputSampleRate)) Hz: \(error.message)")
+            } catch {
+                attemptErrors.append("\(Int(outputSampleRate)) Hz: \(error.localizedDescription)")
+            }
+        }
+
+        throw CLIError(
+            "Failed to initialize CoreAudio AAC encoder for \(target.path). Attempts: " +
+            attemptErrors.joined(separator: " | ")
         )
+    }
 
+    private static func createCoreAudioAACEncoderSession(
+        target: URL,
+        sourceSampleRate: Double,
+        outputSampleRate: Double,
+        channels: UInt32,
+        logger: Logger
+    ) throws -> FLACEncoderSession {
         var outputFormat = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
+            mSampleRate: outputSampleRate,
             mFormatID: kAudioFormatMPEG4AAC,
             mFormatFlags: 0,
             mBytesPerPacket: 0,
@@ -377,15 +403,19 @@ struct ConvertToAAC {
             throw CLIError("CoreAudio failed to create output file for \(target.path)")
         }
 
-        try checkOSStatus(
-            ExtAudioFileSetProperty(
-                outputFile,
-                kExtAudioFileProperty_ClientDataFormat,
-                UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
-                &clientFormat
-            ),
-            context: "ExtAudioFileSetProperty(kExtAudioFileProperty_ClientDataFormat)"
-        )
+        let clientSampleFormat: FLACEncoderClientSampleFormat
+        do {
+            clientSampleFormat = try setCoreAudioClientDataFormat(
+                outputFile: outputFile,
+                sourceSampleRate: sourceSampleRate,
+                channels: channels,
+                targetPath: target.path,
+                logger: logger
+            )
+        } catch {
+            ExtAudioFileDispose(outputFile)
+            throw error
+        }
 
         var converter: AudioConverterRef?
         var converterSize = UInt32(MemoryLayout<AudioConverterRef?>.size)
@@ -449,8 +479,56 @@ struct ConvertToAAC {
         return FLACEncoderSession(
             outputFile: outputFile,
             targetPath: target.path,
-            channels: channels
+            channels: channels,
+            clientSampleFormat: clientSampleFormat
         )
+    }
+
+    private static func setCoreAudioClientDataFormat(
+        outputFile: ExtAudioFileRef,
+        sourceSampleRate: Double,
+        channels: UInt32,
+        targetPath: String,
+        logger: Logger
+    ) throws -> FLACEncoderClientSampleFormat {
+        var int32ClientFormat = pcmClientFormat(
+            sampleRate: sourceSampleRate,
+            channels: channels,
+            sampleFormat: .int32
+        )
+        let int32ClientFormatStatus = ExtAudioFileSetProperty(
+            outputFile,
+            kExtAudioFileProperty_ClientDataFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+            &int32ClientFormat
+        )
+        if int32ClientFormatStatus == noErr {
+            return .int32
+        }
+
+        var float32ClientFormat = pcmClientFormat(
+            sampleRate: sourceSampleRate,
+            channels: channels,
+            sampleFormat: .float32
+        )
+        let float32ClientFormatStatus = ExtAudioFileSetProperty(
+            outputFile,
+            kExtAudioFileProperty_ClientDataFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+            &float32ClientFormat
+        )
+        guard float32ClientFormatStatus == noErr else {
+            throw CLIError(
+                "ExtAudioFileSetProperty(kExtAudioFileProperty_ClientDataFormat) failed " +
+                "for int32 status \(formatOSStatus(int32ClientFormatStatus)) and float32 status \(formatOSStatus(float32ClientFormatStatus))"
+            )
+        }
+
+        logger.warning(
+            "CoreAudio rejected int32 PCM client format for \(targetPath) " +
+            "(status \(formatOSStatus(int32ClientFormatStatus))); falling back to float32 PCM"
+        )
+        return .float32
     }
 
     static func findExecutable(named name: String) -> URL? {
@@ -1241,12 +1319,44 @@ struct ConvertToAAC {
 
     private static func checkOSStatus(_ status: OSStatus, context: String) throws {
         guard status == noErr else {
-            var message = "\(context) failed with status \(status)"
-            if let fourCC = osStatusFourCC(Int(status)) {
-                message += " ('\(fourCC)')"
-            }
+            let message = "\(context) failed with status \(formatOSStatus(status))"
             throw CLIError(message)
         }
+    }
+
+    private static func formatOSStatus(_ status: OSStatus) -> String {
+        var message = "\(status)"
+        if let fourCC = osStatusFourCC(Int(status)) {
+            message += " ('\(fourCC)')"
+        }
+        return message
+    }
+
+    private static func pcmClientFormat(
+        sampleRate: Double,
+        channels: UInt32,
+        sampleFormat: FLACEncoderClientSampleFormat
+    ) -> AudioStreamBasicDescription {
+        let bytesPerFrame = channels * UInt32(sampleFormat.bytesPerSample)
+        return AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: sampleFormat.linearPCMFlags,
+            mBytesPerPacket: bytesPerFrame,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: bytesPerFrame,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+    }
+
+    static func aacEncodeSampleRateCandidates(sourceSampleRate: Double) -> [Double] {
+        var candidates: [Double] = [sourceSampleRate]
+        for fallback in [48_000.0, 44_100.0] where !candidates.contains(fallback) {
+            candidates.append(fallback)
+        }
+        return candidates
     }
 
     private static let flacWriteCallback: FLAC__StreamDecoderWriteCallback = {
@@ -1274,7 +1384,8 @@ struct ConvertToAAC {
             return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT
         }
         let bitsPerSample = Int(state.bitsPerSample ?? 32)
-        let bytesPerFrame = outputChannels * MemoryLayout<Int32>.size
+        let bytesPerSample = encoder.clientSampleFormat.bytesPerSample
+        let bytesPerFrame = outputChannels * bytesPerSample
         var outputData = Data(count: blockSize * bytesPerFrame)
         let sourceChannelPointers = (0 ..< channels).map { bufferPointer[$0] }
 
@@ -1282,7 +1393,12 @@ struct ConvertToAAC {
             guard let base = rawBytes.baseAddress else {
                 return false
             }
-            let outputSamples = base.assumingMemoryBound(to: Int32.self)
+            let outputInt32Samples = encoder.clientSampleFormat == .int32
+                ? base.assumingMemoryBound(to: Int32.self)
+                : nil
+            let outputFloat32Samples = encoder.clientSampleFormat == .float32
+                ? base.assumingMemoryBound(to: Float32.self)
+                : nil
             let isDownmixingMultichannelToStereo = outputChannels == 2 && channels > 2 && !state.explicitLRChannels
 
             for sampleIndex in 0 ..< blockSize {
@@ -1303,7 +1419,14 @@ struct ConvertToAAC {
 
                 let frameStart = sampleIndex * outputChannels
                 if outputChannels == 1 {
-                    outputSamples[frameStart] = normalizedSamples[0]
+                    if let outputInt32Samples {
+                        outputInt32Samples[frameStart] = normalizedSamples[0]
+                    } else if let outputFloat32Samples {
+                        outputFloat32Samples[frameStart] = pcm32DoubleToFloat32(Double(normalizedSamples[0]))
+                    } else {
+                        state.writeFailure = "FLAC encoder has no writable output sample buffer"
+                        return false
+                    }
                 } else {
                     let stereo = downmixFLACSamplesToStereoDouble(
                         normalizedSamples: normalizedSamples,
@@ -1312,8 +1435,16 @@ struct ConvertToAAC {
                     let normalizedStereo = isDownmixingMultichannelToStereo
                         ? applyHeadroomAndLinearPeakScaling(stereoSample: stereo)
                         : stereo
-                    outputSamples[frameStart] = clampDoubleToInt32(normalizedStereo.left)
-                    outputSamples[frameStart + 1] = clampDoubleToInt32(normalizedStereo.right)
+                    if let outputInt32Samples {
+                        outputInt32Samples[frameStart] = clampDoubleToInt32(normalizedStereo.left)
+                        outputInt32Samples[frameStart + 1] = clampDoubleToInt32(normalizedStereo.right)
+                    } else if let outputFloat32Samples {
+                        outputFloat32Samples[frameStart] = pcm32DoubleToFloat32(normalizedStereo.left)
+                        outputFloat32Samples[frameStart + 1] = pcm32DoubleToFloat32(normalizedStereo.right)
+                    } else {
+                        state.writeFailure = "FLAC encoder has no writable output sample buffer"
+                        return false
+                    }
                 }
             }
             return true
@@ -1482,6 +1613,11 @@ struct ConvertToAAC {
         return Int32(value.rounded(.towardZero))
     }
 
+    static func pcm32DoubleToFloat32(_ value: Double) -> Float32 {
+        let clamped = max(Double(Int32.min), min(Double(Int32.max), value))
+        return Float32(clamped / 2_147_483_648.0)
+    }
+
     private static let downmixHeadroomGain: Double = 0.8912509381337456 // -1 dB
 
 }
@@ -1506,15 +1642,43 @@ private final class FLACEncoderSession {
     let outputFile: ExtAudioFileRef
     let targetPath: String
     let channels: UInt32
+    let clientSampleFormat: FLACEncoderClientSampleFormat
 
-    init(outputFile: ExtAudioFileRef, targetPath: String, channels: UInt32) {
+    init(
+        outputFile: ExtAudioFileRef,
+        targetPath: String,
+        channels: UInt32,
+        clientSampleFormat: FLACEncoderClientSampleFormat
+    ) {
         self.outputFile = outputFile
         self.targetPath = targetPath
         self.channels = channels
+        self.clientSampleFormat = clientSampleFormat
     }
 
     deinit {
         ExtAudioFileDispose(outputFile)
+    }
+}
+
+enum FLACEncoderClientSampleFormat {
+    case int32
+    case float32
+
+    var bytesPerSample: Int {
+        switch self {
+        case .int32, .float32:
+            return MemoryLayout<UInt32>.size
+        }
+    }
+
+    var linearPCMFlags: AudioFormatFlags {
+        switch self {
+        case .int32:
+            return kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
+        case .float32:
+            return kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+        }
     }
 }
 
